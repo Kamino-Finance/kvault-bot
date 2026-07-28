@@ -1,0 +1,64 @@
+{
+  "name": "kvaults-investing-bot-workspace",
+  "version": "1.0.0",
+  "description": "Kamino vault investing and allocation-rebalancing bot",
+  "private": true,
+  "packageManager": "yarn@1.22.22",
+  "workspaces": {
+    "packages": [
+      "logger",
+      "tx",
+      "investing-bot"
+    ]
+  },
+  "scripts": {
+    "build": "yarn tsc --build tsconfig.json",
+    "build:prod": "rm -rf dist && yarn tsc",
+    "build:test": "yarn workspace vaults-investing-bot build:test",
+    "clean": "rm -rf logger/dist/ investing-bot/dist/ tx/dist",
+    "clean:deps": "rm -rf node_modules && rm -rf logger/node_modules investing-bot/node_modules tx/node_modules",
+    "clean:all": "yarn clean && yarn clean:deps",
+    "start": "yarn workspace vaults-investing-bot start",
+    "cli": "yarn workspace vaults-investing-bot cli",
+    "dry-run": "NODE_OPTIONS=--max-old-space-size=10000 TS_NODE=true PROFILE=local ALLOCATION_DRY_RUN=true yarn workspace vaults-investing-bot start",
+    "test": "yarn workspace vaults-investing-bot test",
+    "test-localnet": "yarn workspace vaults-investing-bot build:test-localnet && yarn mocha --require tsx --timeout 600000 --exit './investing-bot/tests-localnet/**/*.test.ts'",
+    "start-validator": "test -x ./deps/test-validator-params.sh && solana-test-validator $(./deps/test-validator-params.sh)",
+    "start-validator-and-test-localnet": "COPYFILE_DISABLE=1 start-server-and-test start-validator http://127.0.0.1:8899/health test-localnet",
+    "lint": "yarn prettier --check . && yarn eslint .",
+    "lint:fix": "yarn prettier --write . && yarn eslint . --fix",
+    "compose-clean": "docker-compose rm -f"
+  },
+  "keywords": [
+    "kamino-lend",
+    "klend",
+    "investing",
+    "allocation-rebalancing",
+    "bot",
+    "defi",
+    "solana"
+  ],
+  "license": "ISC",
+  "devDependencies": {
+    "@eslint/compat": "^1.1.1",
+    "@eslint/js": "^9.9.0",
+    "@solana/kit": "^2.3.0",
+    "@types/bn.js": "^5.1.1",
+    "@types/bs58": "^4.0.4",
+    "@types/chai": "^4.3.5",
+    "@types/mocha": "^10.0.1",
+    "@types/node": "^20.12.11",
+    "chai": "^4.3.7",
+    "eslint": "^9.9.0",
+    "eslint-config-prettier": "^9.1.0",
+    "eslint-plugin-import": "^2.18.2",
+    "eslint-plugin-mocha": "^10.1.0",
+    "globals": "^15.9.0",
+    "mocha": "^11.7.6",
+    "prettier": "^3.0.1",
+    "start-server-and-test": "^3.0.11",
+    "ts-mocha": "^11.1.0",
+    "typescript": "^5.5.2",
+    "typescript-eslint": "^8.0.1"
+  }
+}

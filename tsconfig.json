@@ -1,0 +1,15 @@
+{
+  "references": [
+    {
+      "path": "./investing-bot"
+    },
+    {
+      "path": "./tx"
+    },
+    {
+      "path": "./logger"
+    }
+  ],
+  "files": [],
+  "exclude": ["**/node_modules"]
+}

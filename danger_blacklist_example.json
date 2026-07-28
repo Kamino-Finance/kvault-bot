@@ -1,0 +1,10 @@
+{
+  "blacklistedReserves": [
+    {
+      "reserve": "KMNo3nJsBXfcpJTVhZcXLW7RmTwTt4GVFE7suUBo9sS",
+      "triggerName": "infinite-mint",
+      "reason": "combined safety 0.0000 [infinite-mint=0.00: mint supply increased by 120% (from 1000000 to 2200000), threshold: 50%]",
+      "timestamp": "2026-06-30T00:00:00.000Z"
+    }
+  ]
+}

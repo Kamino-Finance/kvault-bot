@@ -1,0 +1,17 @@
+{
+  "name": "kvaults-investing-bot-logger",
+  "version": "1.0.0",
+  "type": "module",
+  "description": "Logging utilities for the Kamino vault investing bot",
+  "license": "UNLICENSED",
+  "main": "dist/index.js",
+  "types": "dist/index.d.ts",
+  "scripts": {
+    "build": "yarn tsc",
+    "lint": "yarn prettier --check . && yarn eslint .",
+    "lint:fix": "yarn prettier --write . && yarn eslint . --fix"
+  },
+  "dependencies": {
+    "winston": "^3.13.1"
+  }
+}

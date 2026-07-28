@@ -1,0 +1,106 @@
+{
+  "allocationsConfig": [
+    {
+      "strategy": "FIXED_WEIGHTS",
+      "vaults": [
+        {
+          "vault": "HDsayqAsDWy3QvANGqh2yNraqcD8Fnjgh73Mhb3WRS5E",
+          "fixedReserves": [
+            {
+              "reserve": "Ga4rZytCpq1unD4DbEJ5bkHeUz9g3oh9AAFEi6vSauXp",
+              "weight": 15000
+            },
+            {
+              "reserve": "D6q6wuQSrifJKZYpR1M8R4YawnLDtDsMmWM1NbBmgJ59",
+              "weight": 80000
+            },
+            {
+              "reserve": "Atj6UREVWa7WxbF2EMKNyfmYUY1U1txughe2gjhcPDCo",
+              "weight": 5000
+            }
+          ]
+        },
+        {
+          "vault": "BqBsS4myH82S4yfqeKjXSF7yErWwSi5WTshSzKmHQgzw",
+          "fixedReserves": [
+            {
+              "reserve": "8rM1AY8M4YP4xNVmxhKnEUnj5CRWrcbcHpcgMoDfgqVi",
+              "weight": 15000
+            },
+            {
+              "reserve": "ESCkPWKHmgNE7Msf77n9yzqJd5kQVWWGy3o5Mgxhvavp",
+              "weight": 80000
+            },
+            {
+              "reserve": "HokDw9LaDf9qNzJf4F21RjHU3K4pRBkGQENvWnRGyRbn",
+              "weight": 5000
+            }
+          ]
+        }
+      ]
+    },
+    {
+      "strategy": "EQUAL",
+      "vaults": ["4FeaCQiVkJ9TVrcoNx4ipoA517qtLcdpzBj2ZyF8zZ6T"],
+      "rebalanceFrequencySeconds": 10800
+    },
+    {
+      "strategy": "RANDOM",
+      "vaults": [
+        "EsUXF9ZBWyynTxahjnTh8Fk7Tj4HgcuyD47AatYp573q",
+        "5gzy3GiGVeeQ1ra52cUS65q1dWdn7LmJUYbrvQmP8wEs",
+        "FyPkCfc2o7AEepuQ2HGQF8oaJ65CNCQDCSexCDNqhWfU"
+      ],
+      "rebalanceFrequencySeconds": 10800,
+      "allocationDryRun": true
+    },
+    {
+      "strategy": "MAX_YIELD_STABLE",
+      "vaults": ["9EnCUR9rwuiPFT8kHYBn5wgRYfGkQNGPf1ACtNpDLGGV", "2jbhtZMoH8RCC2xkpDHCq1DHvpJnFebNwX6qG68pZnWz"],
+      "rebalanceFrequencySeconds": 900,
+      "includeReservesSupplyFarmRewardsApy": true
+    },
+    {
+      "strategy": "MAX_YIELD",
+      "vaults": ["7PRLHH89kyKxzYLirPcDVaRUsMBXauieC2J8PKAugZuC"],
+      "rebalanceFrequencySeconds": 900,
+      "includeReservesSupplyFarmRewardsApy": true
+    },
+    {
+      "strategy": "MAX_YIELD_DRIPPING",
+      "vaults": ["DripMaxYieLd1VautAaBbCcDdEeFfGgHhJjKkMmNnPpQ", "DripMaxYieLd2VautRrSsTtUuVvWwXxYyZz23456789a"],
+      "rebalanceFrequencySeconds": 900,
+      "includeReservesSupplyFarmRewardsApy": true,
+      "drippingRatePercent": 20,
+      "enforceUtilizationCap": true,
+      "maxUtilizationChangeBps": 100,
+      "riskAppetiteMode": "PARANOID",
+      "maxVaultDominanceBps": 6000
+    },
+    {
+      "strategy": "MAX_YIELD_WITH_FIXED_RESERVES",
+      "vaults": [
+        {
+          "vault": "5SGXWx2fX6bvkqipCciT3TYzKVPJXU1Ww7kLkeUhJfaC",
+          "strategy": "MAX_YIELD",
+          "fixedReserves": [
+            "2ov3CMqPBYG3jNBmmpXgK9KMW5GmU5GWZNGcwf7w3BC1",
+            "H3t6qZ1JkguCNTi9uzVKqQ7dvt2cum4XiXWom6Gn5e5S"
+          ],
+          "reservesAllocationPercentageBPS": 7000,
+          "fixedReservesStrategy": "MAX_YIELD",
+          "rebalanceFrequencySeconds": 900,
+          "includeReservesSupplyFarmRewardsApy": false
+        },
+        {
+          "vault": "7cYGMEwQKhdYdugAyQBEqtwG6KhHyuEDcgUrdfGaV6qV",
+          "strategy": "MAX_YIELD",
+          "fixedReserves": ["D6q6wuQSrifJKZYpR1M8R4YawnLDtDsMmWM1NbBmgJ59"],
+          "reservesAllocationPercentageBPS": 7000,
+          "fixedReservesStrategy": "MAX_YIELD",
+          "rebalanceFrequencySeconds": 900
+        }
+      ]
+    }
+  ]
+}

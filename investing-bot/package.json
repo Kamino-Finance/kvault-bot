@@ -1,0 +1,42 @@
+{
+  "name": "vaults-investing-bot",
+  "version": "1.0.0",
+  "description": "Kamino vault investing and allocation-rebalancing service",
+  "type": "module",
+  "main": "dist/index.js",
+  "private": true,
+  "scripts": {
+    "start": "TS_NODE=true yarn node --loader ts-node/esm src/index.ts",
+    "cli": "TS_NODE=true yarn node --loader ts-node/esm src/cli.ts",
+    "test": "TS_NODE=true yarn build:test && yarn ts-mocha './tests/**/*.test.ts' --parallel --exit --reporter spec",
+    "build:test": "TS_NODE=true yarn tsc --project ./tests/tsconfig.json",
+    "build:test-localnet": "yarn tsc --noEmit -p tests-localnet",
+    "perf-benchmark": "TS_NODE=true yarn node --loader ts-node/esm tests/benchmarkCoarseToFine.ts"
+  },
+  "dependencies": {
+    "@kamino-finance/farms-sdk": "^3.2.26",
+    "@kamino-finance/klend-sdk": "9.1.5",
+    "@kamino-finance/kswap-sdk": "^1.9.0",
+    "@solana-program/address-lookup-table": "^0.7.0",
+    "@solana-program/compute-budget": "^0.7.0",
+    "@solana-program/system": "^0.7.0",
+    "@solana-program/token": "^0.5.1",
+    "@solana-program/token-2022": "^0.4.0",
+    "@solana/kit": "^2.3.0",
+    "@solana/sysvars": "^2.3.0",
+    "axios": "^1.6.8",
+    "bn.js": "^5.2.0",
+    "chalk": "^5.3.0",
+    "commander": "^12.1.0",
+    "decimal.js": "^10.4.3",
+    "dotenv": "^16.4.5",
+    "dotenv-expand": "^11.0.6",
+    "kvaults-investing-bot-tx": "*",
+    "lightship": "^6.8.0",
+    "ts-node": "^10.9.2"
+  },
+  "devDependencies": {
+    "@kamino-finance/scope-sdk": "^10.1.0",
+    "tsx": "^4.23.1"
+  }
+}
