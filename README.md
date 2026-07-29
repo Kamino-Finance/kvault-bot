@@ -70,8 +70,8 @@ allocation_config_example.json      strategy config  →  copy, point ALLOCATION
 danger_blacklist_example.json       blacklist format →  DANGER_BLACKLIST_PATH file
 ```
 
-`investing-bot/src/danger/danger_triggers_catalog.md` is the authoritative per-trigger catalog: risk,
-measurement, scoring curve and thresholds for every implemented and planned trigger.
+See [`danger_triggers_catalog.md`](./investing-bot/src/danger/danger_triggers_catalog.md) for the
+authoritative risk, measurement, scoring curve and thresholds of each implemented and planned trigger.
 
 ## What will bite you
 

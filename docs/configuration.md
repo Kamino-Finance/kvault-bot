@@ -21,9 +21,7 @@ applying one strategy to a list of vaults. See
         "<vaultAddress>",
         {
           "vault": "<vaultAddress>",
-          "drippingRatePercent": 10,
-          "fixedReserves": ["<reserveAddress>"],
-          "reservesAllocationPercentageBPS": 3000
+          "drippingRatePercent": 10
         }
       ],
       "rebalanceFrequencySeconds": 900,
@@ -262,10 +260,9 @@ is implemented:
 | Market utilization (borrowed/supplied) | Slippery slope | graduated, linear 90%→100% | PARANOID >95%, SENSIBLE >97%, YOLO >99% |
 | Vault is dominant depositor | Red flag | graduated, floor 0.3 | Only PARANOID, above 70%; or **any** appetite at/above `maxVaultDominanceBps` when set |
 
-Red flags never justify a pull-out on their own, since their score floor sits at or above the `SENSIBLE`
-threshold; they make every other signal worse. `maxVaultDominanceBps` is the one configurable override,
-and it is a hard step rather than a rescaled curve. "Leave above 60%" means exactly that, and the
-graduated score still compounds normally everywhere below it.
+The implemented red flag does not trigger `SENSIBLE` or `YOLO` on its own, but `PARANOID` pulls out above
+70% dominance. `maxVaultDominanceBps` is a hard override for every appetite, not a rescaled curve:
+"leave above 60%" means exactly that, while the graduated score still compounds normally below it.
 
 Not implemented, but documented in the catalog for future work: DEX liquidity depth,
 deposit/withdrawal cap saturation, abnormal borrow spike, standalone oracle staleness, governance-attack
