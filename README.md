@@ -13,17 +13,17 @@ It runs two independent loops, each switchable:
 | Invest | `INVEST_LOOP` | `INVESTOR_SECRET_PATH` | Cranks the permissionless `invest` instruction so each vault's actual token placement matches its on-chain allocation weights. |
 | Allocation rebalance | `ALLOCATION_REBALANCE_LOOP` | `ALLOCATION_ADMIN_SECRET_PATH` | Runs danger detection, computes new allocation weights per strategy, writes them on-chain, then invests. Must sign as each vault's `allocation_admin`. |
 
-The invest loop is permissionless — anyone can run it with any funded keypair. The allocation loop
-signs allocation updates and emergency pull-outs, so its keypair should be the on-chain
-`vault.allocation_admin` of every vault in the config. That is a dedicated role, distinct from
-`vault_admin_authority`: it can be delegated to this bot without handing over vault administration, and
-it is the only authority the bot needs at *runtime*. The vault admin is needed once per reserve, up
-front, to add it to the vault's allocation — the bot can update an allocation but never create one.
+The invest loop is permissionless: any funded keypair can run it.
 
-The program also accepts `vault_admin_authority` for these instructions, so a vault admin key will
-work — but **don't**. Running the bot on the admin key puts full vault administration (fees,
-whitelists, authority changes) behind a long-lived key sitting on a server, for zero extra capability.
-Use `allocation_admin` and keep the admin key offline.
+The allocation loop signs allocation updates and emergency pull-outs, so its keypair should be the
+on-chain `vault.allocation_admin` of every configured vault. That role is distinct from
+`vault_admin_authority`: you can delegate it without handing over vault administration, and it is the
+only authority the bot needs at *runtime*. The vault admin is needed once per reserve, up front, to add
+that reserve to the allocation. The bot updates allocations but never creates them.
+
+The program also accepts `vault_admin_authority` here, so an admin key works. **Don't.** That puts full
+vault administration (fees, whitelists, authority changes) behind a long-lived key on a server, for
+zero extra capability. Use `allocation_admin` and keep the admin key offline.
 
 ---
 
@@ -47,60 +47,59 @@ PROFILE=mainnet-beta yarn start
 
 Before the first live run:
 
-1. **Fund the signers with SOL.** `INVESTOR_SECRET_PATH` pays for invest cranks;
+1. **Fund the signers with SOL.** `INVESTOR_SECRET_PATH` pays for invest cranks.
    `ALLOCATION_ADMIN_SECRET_PATH` pays for allocation updates and emergency pull-outs, and must be an
-   authority every vault in the allocation config accepts — its `allocation_admin` (recommended) or its
+   authority every configured vault accepts: its `allocation_admin` (recommended) or its
    `vault_admin_authority`. Anything else is rejected on-chain.
-2. **Pre-add the reserves with the vault admin key.** The bot only *updates* allocations that already
-   exist in the vault's `vault_allocation_strategy`; inserting a new one is a vault-admin operation it
-   cannot perform. Any reserve it should be able to allocate to must be added first.
+2. **Pre-add the reserves with the vault admin key.** The bot only *updates* allocations already in the
+   vault's `vault_allocation_strategy`; inserting one is a vault-admin operation it cannot perform. Add
+   every reserve it should be able to allocate to first.
 3. **Point `ALLOCATION_CONFIG_PATH`** at your allocation JSON (section 5).
-4. **Point `DANGER_BLACKLIST_PATH`** at a file on a *persistent* volume — the blacklist and the pending
+4. **Point `DANGER_BLACKLIST_PATH`** at a file on a *persistent* volume: the blacklist and pending
    evacuations live there and must survive restarts. With `NODE_ENV=production` the bot refuses to start
    unless this is set explicitly.
 5. **Start in dry-run.** Set `ALLOCATION_DRY_RUN=true` for the first passes: everything is computed and
-   logged, no transactions are sent.
+   logged, nothing is sent.
 
 ### Profile selection
 
 The profile file is loaded from the repo root as `.env.<PROFILE>`. `PROFILE` defaults to `CLUSTER`,
-which defaults to `mainnet-beta` — so with nothing set, `.env.mainnet-beta` is loaded. Values not
-present in the file fall through to real environment variables, so container deployments can skip the
-file entirely. `${VAR}` references inside the file are expanded.
+which defaults to `mainnet-beta`, so with nothing set the bot loads `.env.mainnet-beta`. Values missing
+from the file fall through to real environment variables, so containers can skip the file entirely.
+`${VAR}` references inside it are expanded.
 
 ### Commands
 
 | Command | Purpose |
 | --- | --- |
 | `yarn build` | Compiles all three workspaces (`tsc --build`). |
-| `yarn start` | Runs the bot. `investing-bot` sources run through ts-node; `tx/` and `logger/` are consumed from `dist/`, so changes there need a rebuild — changes under `investing-bot/src/` only need a restart. |
+| `yarn start` | Runs the bot. `investing-bot` sources run through ts-node. `tx/` and `logger/` are consumed from `dist/`, so changes there need a rebuild; changes under `investing-bot/src/` only need a restart. |
 | `yarn dry-run` | `yarn start` with `PROFILE=local ALLOCATION_DRY_RUN=true`. |
 | `yarn cli danger …` | Blacklist management (section 6). |
 | `yarn cli print-rebalance-strategies` | Prints the valid strategy names. |
 
 ### Where paths resolve from
 
-`yarn start` and `yarn cli` both run inside the `investing-bot/` workspace, so **every relative path —
-in the profile file and in a CLI `--path` — resolves against `investing-bot/`, not the repo root.** That
-is why `.env.example` writes `../allocation_config.json` and `../danger_blacklist.json`: `../` *is* the
-repo root. A `./danger_blacklist.json` passed to the CLI lands in `investing-bot/`, where the bot will
-not look for it.
+**Use absolute paths for both config files and both keypairs in any real deployment.** The relative
+form works, but only from the repo root, and it fails quietly.
 
-Only the keypair paths are forgiving — `readSecret` tries the path as given, then relative to the working
-directory, then relative to the workspace root. `ALLOCATION_CONFIG_PATH`, `DANGER_BLACKLIST_PATH` and the
-CLI's `--path` go straight to `fs` with no fallback: wrong path, no file, and (for the blacklist) an
-empty blacklist that silently enforces nothing.
+`yarn start` and `yarn cli` both run inside the `investing-bot/` workspace, so every relative path
+resolves against `investing-bot/`, not the repo root, in the profile file and in a CLI `--path` alike.
+Hence `.env.example` writing `../allocation_config.json` and `../danger_blacklist.json`: `../` *is* the
+repo root. A `./danger_blacklist.json` passed to the CLI lands in `investing-bot/`, where the bot never
+looks.
 
-**Use absolute paths for both config files and both keypairs in any real deployment.** The `../` form
-works, but only from the repo root, and it fails quietly.
+Only keypair paths are forgiving: `readSecret` tries the path as given, then relative to the working
+directory, then the workspace root. `ALLOCATION_CONFIG_PATH`, `DANGER_BLACKLIST_PATH` and `--path` go
+straight to `fs`, so a wrong path means no file, and for the blacklist an empty blacklist that silently
+enforces nothing.
 
 ### Every address and number here is an example
 
-The vault and reserve addresses, strategies, thresholds and tuning values in `.env.example`,
-`allocation_config_example.json`, `danger_blacklist_example.json` and any hardcoded address in the source
-are **illustrative placeholders** — they are there to show the shape of a valid config, not to describe a
-live deployment. Nothing in this repository is the configuration anyone actually runs. Replace all of it
-with your own vaults and your own tuning.
+Every vault and reserve address, strategy, threshold and tuning value in `.env.example`,
+`allocation_config_example.json`, `danger_blacklist_example.json`, and any hardcoded address in the
+source is an illustrative placeholder showing the shape of a valid config. Nothing here is the
+configuration anyone runs. Replace all of it with your own vaults and tuning.
 
 ### Layout
 
@@ -113,22 +112,22 @@ allocation_config_example.json      strategy config  →  copy, point ALLOCATION
 danger_blacklist_example.json       blacklist format →  DANGER_BLACKLIST_PATH file
 ```
 
-`investing-bot/src/danger/danger_triggers_catalog.md` is the authoritative per-trigger catalog:
-risk, measurement, scoring curve and thresholds for every implemented and planned trigger.
+`investing-bot/src/danger/danger_triggers_catalog.md` is the authoritative per-trigger catalog: risk,
+measurement, scoring curve and thresholds for every implemented and planned trigger.
 
 ---
 
 ## 2. Process model
 
 - **Health server.** Started before the loops when `SERVER=true` (default) on `SERVER_PORT`
-  (default `8080`), via [lightship](https://github.com/gajus/lightship) — `/health`, `/live`, `/ready`.
-  Readiness is driven by loop heartbeats: if any enabled loop goes silent for
-  `LOOP_HEARTBEAT_TIMEOUT_MS` (default `3 × RPC_REQUEST_TIMEOUT_MS`), the process reports **not ready**.
+  (default `8080`), via [lightship](https://github.com/gajus/lightship), exposing `/health`, `/live` and
+  `/ready`. Readiness is driven by loop heartbeats: if any enabled loop goes silent for
+  `LOOP_HEARTBEAT_TIMEOUT_MS` (default `3 × RPC_REQUEST_TIMEOUT_MS`), the process reports not ready.
   Point your orchestrator's readiness probe at `/ready` to catch a wedged loop.
 - **Invest loop** runs in the main thread's async context.
-- **Allocation loop** runs in a **worker thread** with a 4 GB heap cap, restarted up to 3 times on
+- **Allocation loop** runs in a worker thread with a 4 GB heap cap, restarted up to 3 times on
   unexpected exit (the counter resets on any heartbeat). After 3 failed restarts the loop is marked
-  permanently unhealthy — readiness goes false and the process needs an external restart.
+  permanently unhealthy: readiness goes false and the process needs an external restart.
 - **Crash isolation.** Both loops are wrapped in a retry harness, so a thrown error inside a pass is
   logged and the loop re-enters rather than killing the process.
 - **Graceful shutdown.** `SIGINT`/`SIGTERM` stop the health server, signal the worker, wait 5 s for it
@@ -144,20 +143,21 @@ Every `LOOP_INTERVAL_MS` the loop resolves its vault set, tops up crank funds, t
 whether to send an invest crank.
 
 **Vault set.** The union of `INVEST_VAULTS` (explicit pubkeys), all vaults owned by `INVEST_OWNERS`,
-and — when `INVEST_UI_VAULTS=true` — every vault listed in Kamino's public resources feed. With none
-of the three set, it invests **every** vault on-chain. The set is re-resolved every pass, so a new
-vault under a configured owner is picked up automatically.
+and, when `INVEST_UI_VAULTS=true`, every vault in Kamino's public resources feed. With none of the three
+set, it invests **every** vault on-chain. The set is re-resolved every pass, so a new vault under a
+configured owner is picked up automatically.
 
-**Crank funding.** The `invest` instruction reconciles cToken↔liquidity rounding by taking a top-up
-of at most a few base units, first from the vault's own `available_crank_funds` and — when those do
-not cover it — from the crank payer's token account. So the signer needs a token account per vault
-mint with a small balance; the bot keeps 10 base units per vault holding that mint as the buffer.
-Missing amounts are acquired via a KSwap exact-out swap from WSOL, or a plain SOL wrap when the vault
-token *is* WSOL; missing ATAs are created first. Each
-swap is guarded twice over: `DEFAULT_SWAP_SLIPPAGE_BPS` on the route itself, and an independent
-reference-price bound (`DEFAULT_PRICE_SLIPPAGE_BPS`) against fresh KSwap prices, plus pre/post balance
-assertions. **If reference prices are missing or older than `MARKET_PRICE_MAX_AGE_SECONDS`, the funding
-swap is skipped** rather than executed blind — the pass continues with existing balances.
+**Crank funding.** The `invest` instruction reconciles cToken↔liquidity rounding with a top-up of at
+most a few base units, drawn first from the vault's own `available_crank_funds`, then from the crank
+payer's token account. So the signer needs a token account per vault mint with a small balance; the bot
+keeps 10 base units per vault holding that mint as the buffer.
+
+Missing amounts come from a KSwap exact-out swap from WSOL, or a plain SOL wrap when the vault token
+*is* WSOL; missing ATAs are created first. Each swap is guarded twice over: `DEFAULT_SWAP_SLIPPAGE_BPS`
+on the route itself, and an independent reference-price bound (`DEFAULT_PRICE_SLIPPAGE_BPS`) against
+fresh KSwap prices, plus pre/post balance assertions. **If reference prices are missing or older than
+`MARKET_PRICE_MAX_AGE_SECONDS`, the funding swap is skipped** rather than executed blind, and the pass
+continues with existing balances.
 
 **Invest decision.** A vault is cranked only when *both* hold:
 
@@ -166,27 +166,31 @@ swap is skipped** rather than executed blind — the pass continues with existin
   so a pure reshuffle is not double-counted. When a vault has no reserves, or all weights are zero,
   the whole invested balance counts as the gap (full deinvest).
 - **Time:** at least `MIN_SECONDS_SINCE_LAST_INVEST` worth of slots have passed since the vault's most
-  recent `last_invest_slot` across all its reserves, *and* the vault's on-chain `min_invest_delay_slots`
-  has elapsed. One vault address is hardcoded to bypass the `MIN_SECONDS_SINCE_LAST_INVEST` check
-  (`CONFIG_MIN_SLOT_BYPASS_VAULT` in `investing_loop.ts`, currently
-  `4TwKA9JXEGeLEpAPLoarhSQoQwoiu12dkDCjSuVvHQUf`) — an example value, not a vault this bot is run
-  against; it only has an effect if that address is in your invest set.
+  recent `last_invest_slot` across all its reserves, *and* the vault's on-chain
+  `min_invest_delay_slots` has elapsed.
 
-Both are off-chain heuristics layered on the program's own gates, which are stricter in two ways: the
-delay is enforced **per reserve** (`last_invest_slot + min_invest_delay_slots`, else `InvestTooSoon`),
+One vault address is hardcoded to bypass the `MIN_SECONDS_SINCE_LAST_INVEST` check:
+`CONFIG_MIN_SLOT_BYPASS_VAULT` in `investing_loop.ts`, currently
+`4TwKA9JXEGeLEpAPLoarhSQoQwoiu12dkDCjSuVvHQUf`. That is an example value, not a vault this bot is run
+against, and it only has an effect if that address is in your invest set.
+
+Both checks are off-chain heuristics layered on the program's own gates, which are stricter in two ways:
+the delay is enforced per reserve (`last_invest_slot + min_invest_delay_slots`, else `InvestTooSoon`),
 and each move must exceed the vault's `min_invest_amount`, else `InvestAmountBelowMinimum`. The one
-exemption is an uncapped full evacuation of a `weight == 0` reserve, which is always allowed to go to
-zero — so a danger pull-out is never blocked by the minimum-amount floor.
+exemption is an uncapped full evacuation of a `weight == 0` reserve, always allowed to go to zero, so a
+danger pull-out is never blocked by the minimum-amount floor.
 
-**Skips.** A vault is skipped when a withdrawal it would need is larger than the source reserve's
-available liquidity and there is not enough idle balance to make the move worthwhile — cranking would
-just fail on-chain. It is also skipped when the danger layer has unfinished business with it: the loop
-reads the blacklist file — both its blacklisted reserves and its per-vault pending evacuations — and
-refuses to invest a vault that still holds exposure to a blacklisted reserve or has an evacuation in
-flight (investing there would push funds back into a reserve the bot is trying to leave).
+**Skips.** A vault is skipped when a withdrawal it needs exceeds the source reserve's available
+liquidity and there is not enough idle balance to make the move worthwhile, since cranking would just
+fail on-chain.
 
-Instructions are sent in batches of 2 (invest) or 4 (ATA creation), preserving SDK order so
-disinvests land before the matching invests.
+It is also skipped when the danger layer has unfinished business with it. The loop reads the blacklist
+file, both its blacklisted reserves and its per-vault pending evacuations, and refuses to invest a vault
+still holding exposure to a blacklisted reserve or with an evacuation in flight, since investing there
+would push funds back into a reserve the bot is trying to leave.
+
+Instructions are sent in batches of 2 (invest) or 4 (ATA creation), preserving SDK order so disinvests
+land before the matching invests.
 
 ---
 
@@ -195,11 +199,11 @@ disinvests land before the matching invests.
 One pass, in order:
 
 1. **Batch-fetch** every configured vault and all of their reserves. On a partial fetch, sleep 10 s and
-   retry — never rebalance on incomplete state.
+   retry. Never rebalance on incomplete state.
 2. **Danger detection** over every vault (section 6). This produces a per-vault directive: either
    *skip* (the vault was just responded to) or *rebalance with these exclusion sets*. A thrown error or
-   timeout anywhere in the danger pass **skips the whole iteration** — fail-closed, never fall through
-   to a normal rebalance.
+   timeout anywhere in the danger pass **skips the whole iteration**. It fails closed and never falls
+   through to a normal rebalance.
 3. **Fetch farm states and prices** for every reserve supply farm and reward mint (only for vaults with
    `includeReservesSupplyFarmRewardsApy` on) plus every vault token.
 4. **Per vault:** if its rebalance frequency has elapsed, compute the new weights with its strategy,
@@ -208,47 +212,45 @@ One pass, in order:
 5. **Sleep** for the smallest `rebalanceFrequencySeconds` across the whole config, then repeat.
 
 **Frequency semantics.** The loop's sleep is the config-wide minimum; each vault additionally checks its
-own `rebalanceFrequencySeconds` before acting. Restarts reset the per-vault timers, so a restart
-triggers a rebalance on the next pass unless the chain rejects it. Dry-run vaults are evaluated on
-every pass regardless of frequency (nothing is sent, so there is nothing to rate-limit).
+own `rebalanceFrequencySeconds` before acting. Restarts reset the per-vault timers, so a restart triggers
+a rebalance on the next pass unless the chain rejects it. Dry-run vaults are evaluated every pass
+regardless of frequency (nothing is sent, so there is nothing to rate-limit).
 
 **Failure containment.** If weight computation throws for a vault, the loop falls back to sending only
-the blacklist-enforcement instructions for that vault (force-zeroing dangerous reserves) instead of
-skipping safety work; if even that fails, the vault is skipped and the others continue. Danger is
-scoped per vault, so one persistently dangerous vault never stalls the fleet.
+that vault's blacklist-enforcement instructions (force-zeroing dangerous reserves) instead of skipping
+safety work; if even that fails, the vault is skipped and the others continue. Danger is scoped per
+vault, so one persistently dangerous vault never stalls the fleet.
 
 ### What the bot writes on-chain, and what it needs from the vault
 
 Every strategy ultimately emits one `update_reserve_allocation` per changed reserve, carrying a
 `target_allocation_weight` and a token `allocation_cap`. Consequences worth knowing before running it:
 
-- **The vault takes its cut before the reserves.** The program computes the unallocated
-  share from `unallocated_weight / (unallocated_weight + Σ reserve weights)`, bounded by
-  `unallocated_tokens_cap`, and only then splits the remainder across reserves by weight. The bot never
-  writes `unallocated_weight` — the vault admin owns it — so raising it lowers everything the bot's
-  weights control, proportionally.
+- **The vault takes its cut before the reserves.** The program computes the unallocated share from
+  `unallocated_weight / (unallocated_weight + Σ reserve weights)`, bounded by `unallocated_tokens_cap`,
+  then splits the remainder across reserves by weight. The bot never writes `unallocated_weight` (the
+  vault admin owns it), so raising it proportionally lowers everything the bot's weights control.
 - **Weights are absolute, and the total differs by strategy.** Nothing normalizes them to a fixed sum:
   `EQUAL` writes 100,000 *per reserve* (300,000 total on a three-reserve vault), `FIXED_WEIGHTS` writes
-  exactly what the config says, and the max-yield family preserves the vault's existing total. On a vault
-  with `unallocated_weight = 0` only the ratios matter, so this is invisible. With a nonzero
-  `unallocated_weight` it is not: the same reserve ratios at a 3× larger total shrink the uninvested
-  share to roughly a third. **Re-check `unallocated_weight` whenever you change a vault's strategy** —
-  no config field expresses this coupling.
-- **The bot only ever updates existing allocations.** It optimizes over the reserves already in
-  `vault_allocation_strategy` and skips any reserve that is not in it. This matters because the program
-  lets `allocation_admin` update an existing allocation but requires `vault_admin_authority` to insert
-  a new one (`WrongAdminOrAllocationAdmin`). **Add every reserve the bot may allocate to with the vault
-  admin key first**; afterwards the bot needs nothing but `allocation_admin`.
+  exactly what the config says, and the max-yield family preserves the vault's existing total. At
+  `unallocated_weight = 0` only ratios matter, so this is invisible; at nonzero it is not, because the
+  same ratios at a 3× larger total shrink the uninvested share to roughly a third. **Re-check
+  `unallocated_weight` whenever you change a vault's strategy.** No config field expresses this coupling.
+- **The bot only ever updates existing allocations.** It optimizes over reserves already in
+  `vault_allocation_strategy` and skips the rest, because the program lets `allocation_admin` update an
+  existing allocation but requires `vault_admin_authority` to insert one
+  (`WrongAdminOrAllocationAdmin`). **Add every reserve the bot may allocate to with the vault admin key
+  first.** Afterwards it needs nothing but `allocation_admin`.
 - **Caps are preserved, not managed.** The bot re-sends each reserve's existing `token_allocation_cap`
-  unchanged (including through a danger pull-out, which zeroes the weight and leaves the cap intact),
-  and it uses the v1 instruction, which preserves whatever `ctoken_allocation_cap` is already set. Both
-  caps stay the vault admin's tool; treat them as a hard ceiling the bot cannot exceed.
-- **Reserve whitelists gate increases only.** If the vault sets
-  `allow_allocations_in_whitelisted_reserves_only`, raising a weight or a cap on a reserve without an
-  add-allocation whitelist entry fails with `ReserveNotWhitelisted`; if it sets
+  unchanged, including through a danger pull-out, which zeroes the weight and leaves the cap intact. It
+  uses the v1 instruction, preserving whatever `ctoken_allocation_cap` is already set. Both caps stay
+  the vault admin's tool; treat them as a hard ceiling the bot cannot exceed.
+- **Reserve whitelists gate increases only.** Under
+  `allow_allocations_in_whitelisted_reserves_only`, raising a weight or cap on a reserve with no
+  add-allocation whitelist entry fails with `ReserveNotWhitelisted`; under
   `allow_invest_in_whitelisted_reserves_only`, the same applies to an invest that *adds* liquidity.
-  Lowering a weight, and any invest that withdraws, are never gated — so a pull-out always goes through,
-  and a whitelist misconfiguration can only ever stall growth, not an exit.
+  Lowering a weight, and any invest that withdraws, are never gated, so a pull-out always goes through
+  and a whitelist misconfiguration can only stall growth, not an exit.
 
 ### The rebalance universe
 
@@ -266,11 +268,11 @@ force-zeroed reserve cannot distort it.
 
 | Strategy | What it does |
 | --- | --- |
-| `EQUAL` | Equal weight to every healthy reserve — a flat 100,000 each, not a normalized split. |
+| `EQUAL` | Equal weight to every healthy reserve: a flat 100,000 each, not a normalized split. |
 | `MAX_YIELD` | Coarse-to-fine grid search over the allocation simplex, maximizing projected vault APY; applies the optimum immediately. |
 | `MAX_YIELD_STABLE` | Same search machinery, minimizing the spread between simulated per-reserve yields. APY is reported but is not currently a tie-breaker. |
-| `MAX_YIELD_WITH_FIXED_RESERVES` | `MAX_YIELD` with a minimum combined allocation (`reservesAllocationPercentageBPS`) across a named `fixedReserves` set. Needs the object vault form — on a plain address string the floor set is empty and the entry silently behaves as `MAX_YIELD`. |
-| `MAX_YIELD_DRIPPING` | Computes the `MAX_YIELD` target — optionally utilization-bounded — and moves only a fraction of the current→target gap per iteration. See below. |
+| `MAX_YIELD_WITH_FIXED_RESERVES` | `MAX_YIELD` with a minimum combined allocation (`reservesAllocationPercentageBPS`) across a named `fixedReserves` set. Needs the object vault form; on a plain address string the floor set is empty and the entry silently behaves as `MAX_YIELD`. |
+| `MAX_YIELD_DRIPPING` | Computes the `MAX_YIELD` target (optionally utilization-bounded) and moves only a fraction of the current→target gap per iteration. See below. |
 | `FIXED_WEIGHTS` | Explicit per-reserve weights from config (`fixedReserves` as `{ reserve, weight }` objects). |
 | `RANDOM` | Random weights. Testing and experimentation only. |
 | `UNCHANGED` | No-op; recomputes and reports current APY without changing the allocation. |
@@ -280,7 +282,7 @@ force-zeroed reserve cannot distort it.
 Exhaustively enumerating allocations is exponential in reserve count, so the search runs in three
 phases: a **coarse** grid over the whole simplex, a **medium** refinement around the best few coarse
 candidates, then a **fine** refinement around the winner. Every candidate is scored by simulating each
-reserve's supply APY at that allocation — including farm-reward APY when
+reserve's supply APY at that allocation, including farm-reward APY when
 `includeReservesSupplyFarmRewardsApy` is on, priced from the token price feed.
 
 `GRID_SEARCH_RESOLUTION` sets the requested coarse granularity (default `0.01` = 1% of AUM per step;
@@ -291,19 +293,18 @@ exponentially more CPU and memory.
 
 #### Deposit and withdrawal constraints
 
-The max-yield family — `MAX_YIELD`, `MAX_YIELD_WITH_FIXED_RESERVES`, `MAX_YIELD_STABLE`,
-`MAX_YIELD_DRIPPING` — projects its allocation
-into per-reserve integer-weight bounds derived from live reserve state: deposit ceilings (reserve
-deposit caps, cap saturation) round down, withdrawal floors (what can actually be pulled out given
-available liquidity) round up. The projection preserves the exact integer weight total, so weights never
-silently inflate or deflate. If no allocation inside the bounds exists, the strategy emits **no
-instructions** rather than an unsatisfiable one.
+The max-yield family (`MAX_YIELD`, `MAX_YIELD_WITH_FIXED_RESERVES`, `MAX_YIELD_STABLE`,
+`MAX_YIELD_DRIPPING`) projects its allocation into per-reserve integer-weight bounds derived from live
+reserve state. Deposit ceilings (reserve deposit caps, cap saturation) round down; withdrawal floors
+(what can actually be pulled out given available liquidity) round up. The projection preserves the exact
+integer weight total, so weights never silently inflate or deflate. If no allocation inside the bounds
+exists, the strategy emits no instructions rather than an unsatisfiable one.
 
-`EQUAL`, `RANDOM` and `FIXED_WEIGHTS` are **cap-unaware**: they emit their weights verbatim (re-sending
-each reserve's existing cap) with no bound projection. Nothing stops them from asking for more than a
-reserve can absorb or less than it can release — the weights are written successfully, and the
-mismatch surfaces later at the invest crank, which under-fills or fails for that reserve. Worth knowing
-before pointing `FIXED_WEIGHTS` at a thin reserve.
+`EQUAL`, `RANDOM` and `FIXED_WEIGHTS` are cap-unaware: they emit weights verbatim (re-sending each
+reserve's existing cap) with no bound projection. Nothing stops them asking for more than a reserve can
+absorb or less than it can release. The weights are written successfully and the mismatch surfaces later
+at the invest crank, which under-fills or fails for that reserve. Worth knowing before pointing
+`FIXED_WEIGHTS` at a thin reserve.
 
 #### `MAX_YIELD_DRIPPING`
 
@@ -316,19 +317,19 @@ Built for vaults where a single large reallocation would move the market or shoc
 - **Utilization cap (opt-in, off by default; `enforceUtilizationCap: true`).** While searching for the
   target, any candidate that would move a reserve's utilization by more than `maxUtilizationChangeBps`
   (default `100` = 1%), or hit a chain-side deposit/withdrawal cap, is rejected. This bounds the
-  *target itself* by each reserve's liquidity depth — the same nominal move is fine in a deep reserve
-  and rejected in a thin one — and stacks with the drip rate. If every candidate is rejected, the vault
-  stays put. With the cap disabled (the default), the search runs straight at the raw `MAX_YIELD`
+  *target itself* by each reserve's liquidity depth, so the same nominal move is fine in a deep reserve
+  and rejected in a thin one, and it stacks with the drip rate. If every candidate is rejected, the
+  vault stays put. With the cap disabled (the default), the search runs straight at the raw `MAX_YIELD`
   optimum.
 - **Dead-band.** No instructions are emitted when the largest current→target gap is at most
-  `max(healthy weight total × fine-grid resolution, 0.5 / drippingRate)` — the first term is the
-  optimizer's own resolution floor (the fine resolution is derived from the vault's invested-reserve
-  count), the second is the smallest gap a drip can move by at least one integer weight unit (2.5 units
-  at the default 20% rate). Below that the search is chasing its own rounding noise, so the vault stays
-  put instead of burning fees.
+  `max(healthy weight total × fine-grid resolution, 0.5 / drippingRate)`. The first term is the
+  optimizer's own resolution floor, where the fine resolution is derived from the vault's
+  invested-reserve count. The second is the smallest gap a drip can move by at least one integer weight
+  unit (2.5 units at the default 20% rate). Below that the search is chasing its own rounding noise, so
+  the vault stays put instead of burning fees.
 - **Bail-outs.** If every APY candidate fails, or the final APY cannot be computed, the strategy keeps
   current weights, reports APY `0`, and emits nothing.
-- **Limits.** Dripping only *redistributes* an existing allocation — a vault whose total healthy weight
+- **Limits.** Dripping only *redistributes* an existing allocation. A vault whose total healthy weight
   is zero (unallocated, or all weight sitting on blacklisted reserves) stays unchanged, because
   dripping from zero would be a jump, not a drip. Fixed-reserve floors are unsupported here; use
   `MAX_YIELD_WITH_FIXED_RESERVES` or `MAX_YIELD_STABLE`.
@@ -337,7 +338,7 @@ Built for vaults where a single large reallocation would move the market or shoc
 
 ## 5. Allocation config
 
-JSON at `ALLOCATION_CONFIG_PATH`, shaped `{ "allocationsConfig": [ … ] }` — an array of entries, each
+JSON at `ALLOCATION_CONFIG_PATH`, shaped `{ "allocationsConfig": [ … ] }`: an array of entries, each
 applying one strategy to a list of vaults. See
 [`allocation_config_example.json`](./allocation_config_example.json) for a full example.
 
@@ -382,7 +383,7 @@ fixed reserves or its own overrides.
 | `maxVaultDominanceBps` | no | Hard dominant-depositor pull-out threshold, in bps of a reserve's total supply (see section 6). Unset by default. Must be in `(0, 10000]`. |
 | `drippingRatePercent` | no | `MAX_YIELD_DRIPPING` only: percent of the current→target gap closed per iteration (default `20`). Must be in `(0, 100]`. |
 | `enforceUtilizationCap` | no | `MAX_YIELD_DRIPPING` only: bound the target by the per-reserve utilization cap (default `false`). |
-| `maxUtilizationChangeBps` | no | `MAX_YIELD_DRIPPING` only: per-iteration utilization-change cap in bps when enforced (default `100`). Must be in `(0, 10000]` — to disable the cap use `enforceUtilizationCap: false`, not `0`. |
+| `maxUtilizationChangeBps` | no | `MAX_YIELD_DRIPPING` only: per-iteration utilization-change cap in bps when enforced (default `100`). Must be in `(0, 10000]`. To disable the cap use `enforceUtilizationCap: false`, not `0`. |
 
 ### Vault-object fields
 
@@ -390,13 +391,13 @@ fixed reserves or its own overrides.
 | --- | --- |
 | `vault` | The vault address (required). |
 | `strategy` | Strategy override for this vault; otherwise the entry-level strategy applies. |
-| `fixedReserves` | Reserve address strings — the set the allocation floor applies to (`MAX_YIELD_WITH_FIXED_RESERVES`, `MAX_YIELD_STABLE`); or `{ reserve, weight }` objects for `FIXED_WEIGHTS`. Duplicates and mixed forms are rejected. |
+| `fixedReserves` | Reserve address strings, the set the allocation floor applies to (`MAX_YIELD_WITH_FIXED_RESERVES`, `MAX_YIELD_STABLE`); or `{ reserve, weight }` objects for `FIXED_WEIGHTS`. Duplicates and mixed forms are rejected. |
 | `reservesAllocationPercentageBPS` | Minimum combined allocation for `fixedReserves`, in bps; must be in `[0, 10000]`. |
 | `includeReservesSupplyFarmRewardsApy` | Farm-reward APY override for this vault. |
 | `allocationDryRun` | Dry-run for this vault (default `false`), overriding the entry-level value. `ALLOCATION_DRY_RUN=true` still wins globally. |
-| `rebalanceFrequencySeconds` | Used only when the entry-level field is omitted — entry level wins. |
+| `rebalanceFrequencySeconds` | Used only when the entry-level field is omitted; entry level wins. |
 | `drippingRatePercent`, `enforceUtilizationCap`, `maxUtilizationChangeBps`, `maxVaultDominanceBps` | Per-vault overrides; the per-vault value wins over the entry-level one. |
-| `fixedReservesStrategy` | Metadata only — the fixed-reserve strategies use the floor/weights above. |
+| `fixedReservesStrategy` | Metadata only; the fixed-reserve strategies use the floor/weights above. |
 
 ### Validation
 
@@ -414,8 +415,8 @@ Before each rebalance iteration, the bot scores every reserve of every configure
 (`investing-bot/src/danger/`). Each trigger returns a safety score in `[0, 1]`; a reserve's scores
 **multiply** into one combined safety score, so several mild red flags compound into a pull-out that
 none of them would cause alone. When a reserve's combined score falls below the vault's risk-appetite
-threshold, the bot **emergency-deinvests from it and forces its weight to zero in one shot** — never
-stepped down gradually, never dripped.
+threshold, the bot **emergency-deinvests from it and forces its weight to zero in one shot**, never
+stepped down gradually and never dripped.
 
 ### Risk appetite
 
@@ -435,19 +436,18 @@ For each dangerous reserve in the vault:
 1. Build an allocation update setting weight `0` while preserving the configured allocation cap; skip
    reserves already at zero.
 2. Send the zeroing instructions (batches of 2, with the vault's LUT). These are sent **even if
-   simulation fails** — a pull-out must not be blocked by a flaky simulation.
+   simulation fails**, because a pull-out must not be blocked by a flaky simulation.
 3. Wait 5 s, reload vault state, send a full deinvest crank, then reload state again so completion is
    judged against post-deinvest balances.
 4. The vault is marked **skip** for this rebalance pass. This is enforced by the type system: a
    responded-to vault carries no rebalance parameters at all, so it structurally cannot be re-exposed
    in the same pass.
 
-If exposure remains afterwards (e.g. the reserve had no liquidity to withdraw), the reserve is recorded
-as a **pending evacuation** for that vault, in the `pendingEvacuations` array of the same
-`DANGER_BLACKLIST_PATH` file — so it survives a restart and is visible to both loops. Pending
-evacuations are retried every pass, block the invest loop from touching that vault, are cleared
-automatically once the exposure reaches zero, and are logged as needing operator intervention while they
-persist.
+If exposure remains afterwards (e.g. the reserve had no liquidity to withdraw), it is recorded as a
+**pending evacuation** for that vault in the `pendingEvacuations` array of the same
+`DANGER_BLACKLIST_PATH` file, so it survives a restart and is visible to both loops. Pending evacuations
+are retried every pass, block the invest loop from touching that vault, clear automatically once the
+exposure reaches zero, and are logged as needing operator intervention while they persist.
 
 ### What happens after the pull-out
 
@@ -456,16 +456,16 @@ Where the reserve lands depends on *why* it was flagged:
 - **Catastrophic** — irreversible loss of funds (infinite mint, collateral exchange-rate increase).
   The reserve goes on the **permanent blacklist**, persisted to `DANGER_BLACKLIST_PATH`. On every later
   iteration it is excluded from every strategy's optimization universe and its on-chain weight is kept
-  force-zeroed. It leaves the blacklist **only by manual operator action** — there is no auto-expiry.
+  force-zeroed. It leaves only by manual operator action; there is no auto-expiry.
 - **Transient / market** — oracle divergence, thin exit liquidity, elevated supply APY, utilization
   squeeze, depeg. The reserve is pulled out and put in a **reinvest cooldown** for 3 passes: excluded
-  from receiving new allocation, but its existing position elsewhere is left untouched and never
-  force-zeroed. This stops a reserve that flaps in and out of danger from thrashing
-  pull-out → reinvest → pull-out. Cooldowns are in-memory and reset on restart.
+  from receiving new allocation, but its existing position is left untouched and never force-zeroed.
+  This stops a reserve that flaps in and out of danger from thrashing pull-out → reinvest → pull-out.
+  Cooldowns are in-memory and reset on restart.
 
-Danger is scoped **per vault**: only a vault that was just responded to skips its rebalance this
-iteration. Every other vault rebalances normally, with blacklisted reserves force-zeroed and cooldown
-reserves excluded from new allocation.
+Danger is scoped **per vault**: only a vault just responded to skips its rebalance this iteration. Every
+other vault rebalances normally, with blacklisted reserves force-zeroed and cooldown reserves excluded
+from new allocation.
 
 ### Fail-closed guarantees
 
@@ -478,16 +478,16 @@ Bad or missing data never reads as "safe":
   so its in-memory trigger baselines survive a transient failure and the catastrophic triggers are not
   blinded on the next pass.
 - A corrupt or structurally invalid blacklist file makes every danger pass throw, so no rebalance runs.
-  The loop retries indefinitely; it does not halt the process — fix the file.
+  The loop retries indefinitely; it does not halt the process. Fix the file.
 - The peg feed (`https://tokens.kamino.finance/tokens-flags.json`) is fetched once per pass. An outage
   reuses the last good snapshot; a cold start with no snapshot at all fails the pass closed.
-- A vault marked dry-run (globally, per entry, or per vault) is detected and logged only — it never
+- A vault marked dry-run (globally, per entry, or per vault) is detected and logged only; it never
   receives real emergency transactions. Catastrophic observations seen only by a dry-run vault stay
   staged rather than being committed as a new baseline.
 
 ### Trigger catalog
 
-Full details — measurement, scoring curves, per-appetite thresholds — are in
+Full details (measurement, scoring curves, per-appetite thresholds) are in
 `investing-bot/src/danger/danger_triggers_catalog.md`. Summary of what is implemented:
 
 | Trigger | Class | Score | Alone triggers pull-out? |
@@ -499,11 +499,11 @@ Full details — measurement, scoring curves, per-appetite thresholds — are in
 | Oracle vs market divergence | Slippery slope | graduated, sqrt decay | PARANOID >4%, SENSIBLE >5.92%, YOLO >8.48% |
 | Secondary-market depeg ($1 stables and LSTs, classified from Kamino's token-flags feed) | Slippery slope | graduated, sqrt decay | $1: >88/124/172 bps; LST: >3.25/5.41/8.29% discount |
 | Market utilization (borrowed/supplied) | Slippery slope | graduated, linear 90%→100% | PARANOID >95%, SENSIBLE >97%, YOLO >99% |
-| Vault is dominant depositor | Red flag | graduated, floor 0.3 | Only PARANOID, above 70% — or **any** appetite at/above `maxVaultDominanceBps` when set |
+| Vault is dominant depositor | Red flag | graduated, floor 0.3 | Only PARANOID, above 70%; or **any** appetite at/above `maxVaultDominanceBps` when set |
 
 Red flags never justify a pull-out on their own (their score floor sits at or above the `SENSIBLE`
 threshold); they make every other signal worse. `maxVaultDominanceBps` is the one configurable
-override: it is a hard step, not a rescaled curve — "leave above 60%" means exactly that, and the
+override, and it is a hard step, not a rescaled curve. "Leave above 60%" means exactly that, and the
 graduated score still compounds normally everywhere below it.
 
 Not implemented (documented in the catalog for future work): DEX liquidity depth, deposit/withdrawal
@@ -511,12 +511,13 @@ cap saturation, abnormal borrow spike, standalone oracle staleness, governance-a
 
 ### Blacklist operations
 
-The file is JSON with two arrays: `blacklistedReserves` (reserve, trigger name, human-readable reason
-carrying the exact scores, timestamp — see
-[`danger_blacklist_example.json`](./danger_blacklist_example.json)) and `pendingEvacuations`, which adds
-the vault address. Manage it with the CLI; every subcommand takes `--path`, defaulting to
-`DANGER_BLACKLIST_PATH` — and a relative `--path` resolves against `investing-bot/`, so prefer an
-absolute one:
+The file is JSON with two arrays. `blacklistedReserves` holds the reserve, trigger name, a
+human-readable reason carrying the exact scores, and a timestamp (see
+[`danger_blacklist_example.json`](./danger_blacklist_example.json)); `pendingEvacuations` holds the same
+plus the vault address.
+
+Manage it with the CLI. Every subcommand takes `--path`, defaulting to `DANGER_BLACKLIST_PATH`; a
+relative `--path` resolves against `investing-bot/`, so prefer an absolute one.
 
 ```bash
 yarn cli danger init                       # create an empty blacklist file (no-op if it exists)
@@ -528,11 +529,11 @@ yarn cli danger clear-all                  # clear the whole blacklist
 Clearing a reserve is the operator saying "this was a false positive, or the cause is resolved". The
 bot starts allocating to it again on the next pass, subject to the triggers re-scoring it.
 
-The CLI covers `blacklistedReserves` only — `list` does not print pending evacuations, and neither
+The CLI covers `blacklistedReserves` only: `list` does not print pending evacuations, and neither
 `clear-reserve` nor `clear-all` removes them. A pending evacuation normally clears itself once the
-exposure is out; one that is stuck because the reserve genuinely cannot be exited has to be edited out
-of the file by hand, and only after deciding the exposure is acceptable — while it is listed, the invest
-loop leaves that vault alone.
+exposure is out. One stuck because the reserve genuinely cannot be exited has to be edited out by hand,
+and only after deciding the exposure is acceptable. While it is listed, the invest loop leaves that
+vault alone.
 
 ---
 
@@ -554,7 +555,7 @@ example file sometimes overrides.
 | `ALLOCATION_ADMIN_SECRET_PATH` | `/run/secrets/allocation_admin` | JSON keypair array signing allocation updates and pull-outs. Should be each configured vault's on-chain `allocation_admin`; `vault_admin_authority` also works but is not recommended (section 1). |
 
 Secret paths are the one forgiving case: tried as given, then relative to the working directory, then
-relative to the workspace root — so `../allocation_admin.json` resolves from either the repo root or
+relative to the workspace root, so `../allocation_admin.json` resolves from either the repo root or
 `investing-bot/`. Config and blacklist paths have no such fallback (see
 [Where paths resolve from](#where-paths-resolve-from)).
 
@@ -635,7 +636,7 @@ a bad `SERVER_PORT`, and a blank `DANGER_BLACKLIST_PATH` all throw.
 - **Persist the blacklist.** On a container platform, mount `DANGER_BLACKLIST_PATH` on a volume. Losing
   it re-admits reserves the bot decided were permanently compromised.
 - **Roll out with dry-run.** `ALLOCATION_DRY_RUN=true` globally, or `allocationDryRun` per entry/vault,
-  lets a new strategy or a new vault run in observation mode — danger detection still evaluates and
+  lets a new strategy or a new vault run in observation mode. Danger detection still evaluates and
   logs, but no transaction is ever sent for that vault.
 - **Watch `/ready`.** A wedged loop shows up there before it shows up in the logs.
 - **Grid resolution is the main cost knob.** If the allocation worker approaches its 4 GB heap cap or
