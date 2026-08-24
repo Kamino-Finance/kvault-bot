@@ -4,13 +4,14 @@ import {
   KaminoManager,
   KaminoReserve,
   KaminoVault,
+  LedgerInstant,
   lamportsToDecimal,
   ReserveAllocationConfig,
   ReserveWithAddress,
   U64_MAX,
   VaultState,
 } from '@kamino-finance/klend-sdk';
-import { Address, IInstruction, Slot, TransactionSigner } from '@solana/kit';
+import { Address, IInstruction, TransactionSigner } from '@solana/kit';
 import { logger } from 'kvaults-investing-bot-logger';
 import BN from 'bn.js';
 import { AllocationWithAPY } from '../utils/maxYieldOptimizers.js';
@@ -78,7 +79,7 @@ export async function getVaultContext(
   kaminoManager: KaminoManager,
   kaminoVault: KaminoVault,
   optimizationReserves: Map<Address, KaminoReserve>,
-  currentSlot: Slot,
+  currentLedgerInstant: LedgerInstant,
   allVaultReserves: Map<Address, KaminoReserve> = optimizationReserves,
   preservedReserves: ReadonlySet<string> = new Set(),
   forcedZeroReserves: ReadonlySet<string> = new Set()
@@ -86,7 +87,12 @@ export async function getVaultContext(
   const vaultState = await kaminoVault.getState();
   const totalAllocationsWeights = getRebalancedAllocationWeight(vaultState, preservedReserves);
 
-  const vaultHoldings = await kaminoManager.getVaultHoldings(vaultState, currentSlot, allVaultReserves, currentSlot);
+  const vaultHoldings = await kaminoManager.getVaultHoldings(
+    vaultState,
+    currentLedgerInstant,
+    allVaultReserves,
+    currentLedgerInstant
+  );
   const totalVaultAUMTokens = Decimal.max(vaultHoldings.totalAUMIncludingFees.sub(vaultHoldings.pendingFees ?? 0), 0);
   const vaultAUMTokens = getRebalancedVaultAUMTokens(
     totalVaultAUMTokens,
@@ -111,7 +117,7 @@ export async function getVaultContext(
       vaultAUMTokens: totalVaultAUMTokens,
       currentVaultAllocations,
       allVaultReserves,
-      currentSlot,
+      currentLedgerInstant,
       forcedZeroReserves,
     },
   };
@@ -158,8 +164,7 @@ export function buildReserveConstraintsBase(
   reserve: KaminoReserve,
   currentWeight: Decimal,
   investedTokensInReserve: Decimal,
-  currentSlot: Slot,
-  currentUnixTimestamp: number
+  currentLedgerInstant: LedgerInstant
 ): Omit<ReserveConstraints, 'targetWeight'> {
   const decimals = reserve.state.liquidity.mintDecimals.toNumber();
   const withdrawalCapDisabled = reserve.state.config.depositWithdrawalCap.configIntervalLengthSeconds.toNumber() === 0;
@@ -171,11 +176,11 @@ export function buildReserveConstraintsBase(
       ? null
       : lamportsToDecimal(reserve.state.config.depositLimit.toString(), decimals),
     currentTotalSupplyInReserveTokens: lamportsToDecimal(
-      reserve.getEstimatedTotalSupply(currentSlot, 0).toString(),
+      reserve.getEstimatedTotalSupply(currentLedgerInstant, 0).toString(),
       decimals
     ),
     availableLiquidityInReserveTokens: lamportsToDecimal(
-      reserve.getFreelyAvailableLiquidityAmount(currentSlot).toString(),
+      reserve.getFreelyAvailableLiquidityAmount(currentLedgerInstant, 0).toString(),
       decimals
     ),
     reserveWithdrawalCapCapacityTokens: withdrawalCapDisabled
@@ -183,7 +188,10 @@ export function buildReserveConstraintsBase(
       : lamportsToDecimal(reserve.getDepositWithdrawalCapCapacity().toString(), decimals),
     reserveWithdrawalCapCurrentTokens: withdrawalCapDisabled
       ? null
-      : lamportsToDecimal(reserve.getDepositWithdrawalCapCurrent(currentUnixTimestamp).toString(), decimals),
+      : lamportsToDecimal(
+          reserve.getDepositWithdrawalCapCurrent(Number(currentLedgerInstant.blockTime)).toString(),
+          decimals
+        ),
   };
 }
 
@@ -197,15 +205,19 @@ export async function buildAllocationRebalanceInstructions(
   vaultsReserves: Map<Address, KaminoReserve>,
   proposedAllocation: AllocationWithAPY,
   signer: TransactionSigner,
-  currentSlot: Slot,
-  currentUnixTimestamp: number,
+  currentLedgerInstant: LedgerInstant,
   allVaultReserves: Map<Address, KaminoReserve> = vaultsReserves,
   preservedReserves: ReadonlySet<string> = new Set(),
   forcedZeroReserves: ReadonlySet<string> = new Set()
 ): Promise<IInstruction[]> {
   const allocationRebalanceIxs: IInstruction[] = [];
 
-  const vaultHoldings = await kaminoManager.getVaultHoldings(vaultState, currentSlot, allVaultReserves, currentSlot);
+  const vaultHoldings = await kaminoManager.getVaultHoldings(
+    vaultState,
+    currentLedgerInstant,
+    allVaultReserves,
+    currentLedgerInstant
+  );
   const investedInReservesTokens = vaultHoldings.investedInReserves;
   const totalVaultAUMTokens = Decimal.max(vaultHoldings.totalAUMIncludingFees.sub(vaultHoldings.pendingFees), 0);
   const rebalancedVaultAUMTokens = getRebalancedVaultAUMTokens(
@@ -225,7 +237,7 @@ export async function buildAllocationRebalanceInstructions(
     vaultAUMTokens: totalVaultAUMTokens,
     currentVaultAllocations: kaminoManager.getVaultAllocations(vaultState),
     allVaultReserves,
-    currentSlot,
+    currentLedgerInstant,
     forcedZeroReserves,
   }).targetUnallocatedAmount;
   // Weight bounds apply only to tokens the SDK projects into reserves; including the unallocated
@@ -269,8 +281,7 @@ export async function buildAllocationRebalanceInstructions(
         reserve,
         currentWeight,
         investedTokensInReserve,
-        currentSlot,
-        currentUnixTimestamp
+        currentLedgerInstant
       ),
       targetWeight,
     };
@@ -317,7 +328,7 @@ export async function buildAllocationRebalanceInstructions(
     vaultAUMTokens: totalVaultAUMTokens,
     currentVaultAllocations: kaminoManager.getVaultAllocations(vaultState),
     allVaultReserves,
-    currentSlot,
+    currentLedgerInstant,
     forcedZeroReserves,
   });
   for (const [reserveAddress] of finalAllocation) {
@@ -334,8 +345,7 @@ export async function buildAllocationRebalanceInstructions(
       reserve,
       new Decimal(allocForReserve.targetAllocationWeight.toString()),
       investedInReservesTokens.get(reserveAddress) ?? new Decimal(0),
-      currentSlot,
-      currentUnixTimestamp
+      currentLedgerInstant
     );
     const targetTokens = targetAllocation.targetReservesAllocation.get(reserveAddress) ?? new Decimal(0);
     const constraintType = getTargetTokenConstraintType(constraints, targetTokens);

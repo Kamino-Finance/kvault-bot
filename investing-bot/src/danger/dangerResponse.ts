@@ -1,4 +1,5 @@
 import {
+  getCurrentLedgerInstant,
   KaminoManager,
   KaminoVault,
   KaminoReserve,
@@ -94,8 +95,8 @@ export async function executeDangerResponse(
   // Reload state and trigger deinvest
   await delay(5000);
   await kaminoVault.reloadState();
-  const currentSlot = await kaminoManager.getRpc().getSlot().send();
-  const investIxs = await kaminoManager.investAllReservesIxs(allocationAdmin, kaminoVault, currentSlot, true);
+  const currentLedgerInstant = await getCurrentLedgerInstant(kaminoManager.getRpc());
+  const investIxs = await kaminoManager.investAllReservesIxs(allocationAdmin, kaminoVault, currentLedgerInstant, true);
   await sendInstructionBatches({
     connectionPool: c,
     payer: allocationAdmin,

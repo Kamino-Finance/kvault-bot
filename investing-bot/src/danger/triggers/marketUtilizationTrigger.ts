@@ -43,9 +43,9 @@ export class MarketUtilizationTrigger implements DangerTrigger {
     context: TriggerContext
   ): Promise<TriggerResult> {
     try {
-      // Slot-aware read: interest accrued since the reserve's last on-chain refresh moves both
+      // Ledger-aware read: interest accrued since the reserve's last on-chain refresh moves both
       // borrowed and supplied amounts, so the stale ratio can understate the current squeeze.
-      const utilization = reserve.getEstimatedUtilizationRatio(context.currentSlot, 0);
+      const utilization = reserve.getEstimatedUtilizationRatio(context.currentLedgerInstant, 0);
       // Utilization is borrowed / supplied, so it cannot be negative or non-finite. Such a reading is
       // garbage, not a safe reserve: abort the pass instead of clamping it up to a 1.0 score.
       if (!Number.isFinite(utilization) || utilization < 0) {

@@ -1,7 +1,7 @@
 import { Decimal } from 'decimal.js';
 
-import { KaminoManager, KaminoReserve, KaminoVault } from '@kamino-finance/klend-sdk';
-import { Address, Slot, TransactionSigner } from '@solana/kit';
+import { KaminoManager, KaminoReserve, KaminoVault, LedgerInstant } from '@kamino-finance/klend-sdk';
+import { Address, TransactionSigner } from '@solana/kit';
 import { logger } from 'kvaults-investing-bot-logger';
 import { Farms, FarmState } from '@kamino-finance/farms-sdk';
 import { getReserveAllocationsForUniverse } from '../rebalanceUniverse.js';
@@ -58,8 +58,7 @@ export interface MaxYieldDrippingStrategyRequest {
   kaminoVault: KaminoVault;
   vaultsReserves: Map<Address, KaminoReserve>;
   signer: TransactionSigner;
-  currentSlot: Slot;
-  currentUnixTimestamp: number;
+  currentLedgerInstant: LedgerInstant;
   gridSearchResolution: number;
   shouldIncludeFarmRewards: boolean;
   drippingRatePercent?: number;
@@ -79,8 +78,7 @@ export async function getMaxYieldDrippingAllocationRebalanceIxs({
   kaminoVault,
   vaultsReserves,
   signer,
-  currentSlot,
-  currentUnixTimestamp,
+  currentLedgerInstant,
   gridSearchResolution,
   shouldIncludeFarmRewards,
   drippingRatePercent = DEFAULT_DRIPPING_RATE_PERCENT,
@@ -99,7 +97,7 @@ export async function getMaxYieldDrippingAllocationRebalanceIxs({
     kaminoManager,
     kaminoVault,
     vaultsReserves,
-    currentSlot,
+    currentLedgerInstant,
     allVaultReserves,
     preservedReserves,
     forcedZeroReserves
@@ -156,7 +154,7 @@ export async function getMaxYieldDrippingAllocationRebalanceIxs({
       const investedTokens = vaultContext.investedInReservesTokensMap.get(reserveAddress) ?? new Decimal(0);
       baseConstraintsByReserve.set(
         reserveAddress,
-        buildReserveConstraintsBase(reserveAddress, reserve, weight, investedTokens, currentSlot, currentUnixTimestamp)
+        buildReserveConstraintsBase(reserveAddress, reserve, weight, investedTokens, currentLedgerInstant)
       );
     }
     utilizationFilter = (allocation: Decimal[], reservesWithAllocations: ReserveWithAllocation[]): boolean => {
@@ -195,7 +193,7 @@ export async function getMaxYieldDrippingAllocationRebalanceIxs({
         const tokenDeltaLamports = tokenDelta.abs().mul(new Decimal(10).pow(decimals));
         const action = tokenDelta.gt(0) ? 'deposit' : 'withdraw';
         const simulatedUtil = new Decimal(
-          reserve.calcSimulatedUtilizationRatio(tokenDeltaLamports, action, currentSlot, 0)
+          reserve.calcSimulatedUtilizationRatio(tokenDeltaLamports, action, currentLedgerInstant, 0)
         );
         if (simulatedUtil.sub(currentUtil).abs().gt(maxUtilChange)) {
           return false;
@@ -212,7 +210,7 @@ export async function getMaxYieldDrippingAllocationRebalanceIxs({
     vaultsReserves,
     healthyTotalWeight,
     gridSearchResolution,
-    currentSlot,
+    currentLedgerInstant,
     vaultContext.vaultAUMTokens,
     vaultContext.investedInReservesTokensMap,
     shouldIncludeFarmRewards,
@@ -314,7 +312,7 @@ export async function getMaxYieldDrippingAllocationRebalanceIxs({
       chosenTotalWeight,
       vaultContext.vaultAUMTokens,
       vaultContext.allInvestedInReservesTokensMap,
-      currentSlot,
+      currentLedgerInstant,
       compoundingPeriods,
       shouldIncludeFarmRewards,
       farmsClient,
@@ -367,8 +365,7 @@ export async function getMaxYieldDrippingAllocationRebalanceIxs({
     vaultsReserves,
     bestAllocation,
     signer,
-    currentSlot,
-    currentUnixTimestamp,
+    currentLedgerInstant,
     allVaultReserves,
     preservedReserves,
     forcedZeroReserves

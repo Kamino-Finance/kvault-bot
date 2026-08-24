@@ -1,7 +1,7 @@
 import { Decimal } from 'decimal.js';
-import { KaminoManager, KaminoReserve, KaminoVault } from '@kamino-finance/klend-sdk';
+import { KaminoManager, KaminoReserve, KaminoVault, LedgerInstant } from '@kamino-finance/klend-sdk';
 import { FarmState } from '@kamino-finance/farms-sdk';
-import { Address, Slot, TransactionSigner } from '@solana/kit';
+import { Address, TransactionSigner } from '@solana/kit';
 import {
   AllocationWithAPYAndIxs,
   AllocationWithStabilizationFactorAndAPYAndIxs,
@@ -15,8 +15,7 @@ interface MaxYieldStrategyRequest {
   kaminoVault: KaminoVault;
   vaultsReserves: Map<Address, KaminoReserve>;
   signer: TransactionSigner;
-  currentSlot: Slot;
-  currentUnixTimestamp: number;
+  currentLedgerInstant: LedgerInstant;
   gridSearchResolution: number;
   shouldIncludeFarmRewards: boolean;
   compoundingPeriods?: number;
@@ -35,8 +34,7 @@ export async function getMaxYieldAllocationRebalanceIxs({
   kaminoVault,
   vaultsReserves,
   signer,
-  currentSlot,
-  currentUnixTimestamp,
+  currentLedgerInstant,
   gridSearchResolution,
   shouldIncludeFarmRewards,
   compoundingPeriods = 1,
@@ -53,7 +51,7 @@ export async function getMaxYieldAllocationRebalanceIxs({
     kaminoManager,
     kaminoVault,
     vaultsReserves,
-    currentSlot,
+    currentLedgerInstant,
     allVaultReserves,
     preservedReserves,
     forcedZeroReserves
@@ -64,7 +62,7 @@ export async function getMaxYieldAllocationRebalanceIxs({
     vaultsReserves,
     vaultContext.totalAllocationsWeights,
     gridSearchResolution,
-    currentSlot,
+    currentLedgerInstant,
     vaultContext.vaultAUMTokens,
     vaultContext.investedInReservesTokensMap,
     shouldIncludeFarmRewards,
@@ -91,8 +89,7 @@ export async function getMaxYieldAllocationRebalanceIxs({
       vaultsReserves,
       bestAllocation,
       signer,
-      currentSlot,
-      currentUnixTimestamp,
+      currentLedgerInstant,
       allVaultReserves,
       preservedReserves,
       forcedZeroReserves
@@ -106,8 +103,7 @@ export async function getMaxYieldStabilizationAllocationRebalanceIxs({
   kaminoVault,
   vaultsReserves,
   signer,
-  currentSlot,
-  currentUnixTimestamp,
+  currentLedgerInstant,
   gridSearchResolution,
   shouldIncludeFarmRewards,
   compoundingPeriods = 1,
@@ -124,7 +120,7 @@ export async function getMaxYieldStabilizationAllocationRebalanceIxs({
     kaminoManager,
     kaminoVault,
     vaultsReserves,
-    currentSlot,
+    currentLedgerInstant,
     allVaultReserves,
     preservedReserves,
     forcedZeroReserves
@@ -135,7 +131,7 @@ export async function getMaxYieldStabilizationAllocationRebalanceIxs({
     vaultsReserves,
     vaultContext.totalAllocationsWeights,
     gridSearchResolution,
-    currentSlot,
+    currentLedgerInstant,
     vaultContext.vaultAUMTokens,
     vaultContext.investedInReservesTokensMap,
     shouldIncludeFarmRewards,
@@ -167,8 +163,7 @@ export async function getMaxYieldStabilizationAllocationRebalanceIxs({
       vaultsReserves,
       bestAllocation,
       signer,
-      currentSlot,
-      currentUnixTimestamp,
+      currentLedgerInstant,
       allVaultReserves,
       preservedReserves,
       forcedZeroReserves

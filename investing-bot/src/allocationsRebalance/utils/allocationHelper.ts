@@ -5,6 +5,7 @@ import {
   DEFAULT_PUBLIC_KEY,
   isCtokenAllocationCapUncapped,
   KaminoReserve,
+  LedgerInstant,
   lamportsToDecimal,
   ReserveAllocationForCompute,
   ReserveAllocationOverview,
@@ -12,7 +13,7 @@ import {
   VaultAllocationResult,
   VaultState,
 } from '@kamino-finance/klend-sdk';
-import { Address, Slot } from '@solana/kit';
+import { Address } from '@solana/kit';
 import { logger } from 'kvaults-investing-bot-logger';
 import { FarmAndKey, FarmIncentives, Farms, FarmState } from '@kamino-finance/farms-sdk';
 import { StabilizationFactorAndAPY } from './maxYieldOptimizers.js';
@@ -24,7 +25,7 @@ export interface VaultAllocationProjectionContext {
   vaultAUMTokens: Decimal;
   currentVaultAllocations: Map<Address, ReserveAllocationOverview>;
   allVaultReserves: Map<Address, KaminoReserve>;
-  currentSlot: Slot;
+  currentLedgerInstant: LedgerInstant;
   forcedZeroReserves?: ReadonlySet<string>;
 }
 
@@ -49,7 +50,7 @@ export function computeVaultTargetAllocation(
       if (!reserve) {
         throw new Error(`Reserve ${reserveAddress} not found while computing finite cToken allocation cap`);
       }
-      collateralExchangeRate = reserve.getEstimatedCollateralExchangeRate(context.currentSlot, 0);
+      collateralExchangeRate = reserve.getEstimatedCollateralExchangeRate(context.currentLedgerInstant, 0);
     }
 
     allocationsForCompute.set(
@@ -67,12 +68,32 @@ export function computeVaultTargetAllocation(
   );
 }
 
+/** Uses the post-refresh, post-allocation supply for the forward reserve-rewards APR. */
+function calculateSimulatedReserveRewardsSupplyAPR(
+  reserve: KaminoReserve,
+  liquidityDeltaLamports: Decimal,
+  currentLedgerInstant: LedgerInstant
+): Decimal {
+  const simulatedPostAllocationSupplyLamports = reserve
+    .getEstimatedTotalSupply(currentLedgerInstant, 0)
+    .add(liquidityDeltaLamports);
+  if (simulatedPostAllocationSupplyLamports.lte(0)) {
+    return new Decimal(0);
+  }
+
+  const configuredRewardsAPR = new Decimal(reserve.state.config.rewardsAmountPerAccrualUnit.toString())
+    .mul(reserve.accrualUnitsPerYear().toString())
+    .div(simulatedPostAllocationSupplyLamports);
+  const maxRewardsAPR = new Decimal(reserve.reserveRewardsMaxAprBps).div(FULL_BPS);
+  return Decimal.min(configuredRewardsAPR, maxRewardsAPR).mul(reserve.rateAdjustmentFactor());
+}
+
 /// returns the simulated supply yield of the reserve if we remove `prevVaultAllocTokens` (which is current allocation) and deposit `newVaultAllocTokens` (which is the new allocation)
 export function evaluateReserveSupplyYieldWithNewAllocation(
   reserve: KaminoReserve,
   newVaultAllocTokens: Decimal,
   prevVaultAllocTokens: Decimal,
-  currentSlot: Slot,
+  currentLedgerInstant: LedgerInstant,
   compoundPeriods: number
 ): Decimal {
   const decimals = new Decimal(reserve.state.liquidity.mintDecimals.toString());
@@ -80,8 +101,17 @@ export function evaluateReserveSupplyYieldWithNewAllocation(
   const action = liquidityDeltaLamports.gt(0) ? 'deposit' : 'withdraw';
   // 4th SDK parameter is referralFeeBps, not compounding - vault deposits
   // carry no referral fee (compounding is applied below via perPeriodAPY)
-  const simulatedReserveAPR = reserve.calcSimulatedSupplyAPR(liquidityDeltaLamports.abs(), action, currentSlot, 0);
-  const simulatedReserveAPY = calculateAPYFromAPR(simulatedReserveAPR);
+  const simulatedBorrowInterestSupplyAPR = new Decimal(
+    reserve.calcSimulatedSupplyAPR(liquidityDeltaLamports.abs(), action, currentLedgerInstant, 0)
+  );
+  const simulatedRewardsSupplyAPR = calculateSimulatedReserveRewardsSupplyAPR(
+    reserve,
+    liquidityDeltaLamports,
+    currentLedgerInstant
+  );
+  const simulatedReserveAPY = calculateAPYFromAPR(
+    simulatedBorrowInterestSupplyAPR.add(simulatedRewardsSupplyAPR).toNumber()
+  );
 
   const perPeriodAPY = new Decimal(simulatedReserveAPY).div(compoundPeriods);
   return perPeriodAPY;
@@ -149,7 +179,7 @@ export async function computeOverallVaultApy(
   allocationWeightsSum: Decimal,
   vaultAUMTokens: Decimal,
   investedInReservesTokens: Map<Address, Decimal>,
-  currentSlot: Slot,
+  currentLedgerInstant: LedgerInstant,
   compoundingPeriods: number,
   shouldIncludeFarmRewards: boolean,
   farmsClient: Farms,
@@ -192,7 +222,7 @@ export async function computeOverallVaultApy(
       currentReserve,
       newReserveAllocTokens,
       prevReserveAllocTokens,
-      currentSlot,
+      currentLedgerInstant,
       compoundingPeriods
     );
 
@@ -233,7 +263,7 @@ export function computeOverallVaultAPYFromReservesMap(
   vaultAUMTokens: Decimal,
   investedInReservesTokens: Map<Address, Decimal>,
   vaultsReserves: Map<Address, KaminoReserve>,
-  currentSlot: Slot,
+  currentLedgerInstant: LedgerInstant,
   compoundingPeriods: number,
   verbose: boolean = false,
   projectionContext?: VaultAllocationProjectionContext
@@ -275,7 +305,7 @@ export function computeOverallVaultAPYFromReservesMap(
       reserveState,
       newReserveAllocTokens,
       investedInReservesTokens.get(reserveAddress) ?? new Decimal(0),
-      currentSlot,
+      currentLedgerInstant,
       compoundingPeriods
     );
     if (verbose) {
@@ -297,7 +327,7 @@ export async function computeStabilizationFactorForVault(
   allocationWeightsSum: Decimal,
   vaultAUMTokens: Decimal,
   investedInReservesTokens: Map<Address, Decimal>,
-  currentSlot: Slot,
+  currentLedgerInstant: LedgerInstant,
   compoundingPeriods: number,
   shouldIncludeFarmRewards: boolean,
   farmsClient: Farms,
@@ -345,7 +375,7 @@ export async function computeStabilizationFactorForVault(
       currentReserve,
       newReserveAllocTokens,
       prevReserveAllocTokens,
-      currentSlot,
+      currentLedgerInstant,
       compoundingPeriods
     );
 

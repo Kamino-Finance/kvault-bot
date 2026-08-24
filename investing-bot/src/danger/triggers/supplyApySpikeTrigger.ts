@@ -28,7 +28,7 @@ export class SupplyApySpikeTrigger implements DangerTrigger {
     context: TriggerContext
   ): Promise<TriggerResult> {
     try {
-      const supplyApy = reserve.totalSupplyAPY(context.currentSlot);
+      const supplyApy = reserve.totalSupplyAPY(context.currentLedgerInstant);
       if (!Number.isFinite(supplyApy)) {
         throw new Error(`invalid supply APY ${supplyApy}`);
       }

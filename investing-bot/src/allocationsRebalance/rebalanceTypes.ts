@@ -1,7 +1,7 @@
 import { Decimal } from 'decimal.js';
 
-import { KaminoManager, KaminoReserve, KaminoVault } from '@kamino-finance/klend-sdk';
-import { Address, IInstruction, Slot, TransactionSigner } from '@solana/kit';
+import { KaminoManager, KaminoReserve, KaminoVault, LedgerInstant } from '@kamino-finance/klend-sdk';
+import { Address, IInstruction, TransactionSigner } from '@solana/kit';
 import { logger } from 'kvaults-investing-bot-logger';
 import { Farms, FarmState } from '@kamino-finance/farms-sdk';
 import { AllocationWithAPYAndIxs } from './utils/maxYieldOptimizers.js';
@@ -50,8 +50,7 @@ export interface RebalanceAllocationRequest {
   vaultsReserves: Map<Address, KaminoReserve>;
   strategy: RebalanceStrategy;
   signer: TransactionSigner;
-  currentSlot: Slot;
-  currentUnixTimestamp: number;
+  currentLedgerInstant: LedgerInstant;
   gridSearchResolution: number;
   shouldIncludeFarmRewards: boolean;
   fixedReservesConfig?: FixedReservesWithConfig;
@@ -73,8 +72,7 @@ export async function rebalanceAllocation({
   vaultsReserves,
   strategy,
   signer,
-  currentSlot,
-  currentUnixTimestamp,
+  currentLedgerInstant,
   gridSearchResolution,
   shouldIncludeFarmRewards,
   fixedReservesConfig,
@@ -126,7 +124,7 @@ export async function rebalanceAllocation({
         rebalanceUniverse.healthyVaultReserves,
         fixedReservesWeights,
         signer,
-        currentSlot,
+        currentLedgerInstant,
         undefined,
         verbose,
         vaultsReserves,
@@ -139,7 +137,7 @@ export async function rebalanceAllocation({
         kaminoVault,
         rebalanceUniverse.healthyVaultReserves,
         signer,
-        currentSlot,
+        currentLedgerInstant,
         undefined,
         verbose,
         vaultsReserves,
@@ -152,8 +150,7 @@ export async function rebalanceAllocation({
         kaminoVault,
         vaultsReserves: rebalanceUniverse.healthyVaultReserves,
         signer,
-        currentSlot,
-        currentUnixTimestamp,
+        currentLedgerInstant,
         gridSearchResolution,
         shouldIncludeFarmRewards,
         farmsToFarmStateMap,
@@ -170,7 +167,7 @@ export async function rebalanceAllocation({
         kaminoVault,
         rebalanceUniverse.healthyVaultReserves,
         signer,
-        currentSlot,
+        currentLedgerInstant,
         undefined,
         verbose,
         vaultsReserves,
@@ -189,8 +186,7 @@ export async function rebalanceAllocation({
         kaminoVault,
         vaultsReserves: rebalanceUniverse.healthyVaultReserves,
         signer,
-        currentSlot,
-        currentUnixTimestamp,
+        currentLedgerInstant,
         gridSearchResolution,
         shouldIncludeFarmRewards,
         compoundingPeriods: 1,
@@ -209,7 +205,7 @@ export async function rebalanceAllocation({
         kaminoManager,
         kaminoVault,
         rebalanceUniverse.healthyVaultReserves,
-        currentSlot,
+        currentLedgerInstant,
         undefined,
         verbose,
         vaultsReserves,
@@ -228,8 +224,7 @@ export async function rebalanceAllocation({
         kaminoVault,
         vaultsReserves: rebalanceUniverse.healthyVaultReserves,
         signer,
-        currentSlot,
-        currentUnixTimestamp,
+        currentLedgerInstant,
         gridSearchResolution,
         shouldIncludeFarmRewards,
         compoundingPeriods: 1,
@@ -255,8 +250,7 @@ export async function rebalanceAllocation({
         kaminoVault,
         vaultsReserves: rebalanceUniverse.healthyVaultReserves,
         signer,
-        currentSlot,
-        currentUnixTimestamp,
+        currentLedgerInstant,
         gridSearchResolution,
         shouldIncludeFarmRewards,
         drippingRatePercent,
@@ -284,7 +278,7 @@ export async function rebalanceAllocation({
       kaminoVault,
       rebalanceUniverse.healthyVaultReserves,
       allocationWithIxsAndApy.bestAllocation,
-      currentSlot,
+      currentLedgerInstant,
       shouldIncludeFarmRewards,
       farmsClient,
       farmsToFarmStateMap,

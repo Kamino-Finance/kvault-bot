@@ -1,5 +1,11 @@
-import { KaminoManager, KaminoReserve, KaminoVault } from '@kamino-finance/klend-sdk';
-import { address, Address, KeyPairSigner, Rpc, Slot, SolanaRpcApi } from '@solana/kit';
+import {
+  getCurrentLedgerInstant,
+  KaminoManager,
+  KaminoReserve,
+  KaminoVault,
+  LedgerInstant,
+} from '@kamino-finance/klend-sdk';
+import { address, Address, KeyPairSigner, Rpc, SolanaRpcApi } from '@solana/kit';
 import { logger } from 'kvaults-investing-bot-logger';
 import { ConnectionPool } from 'kvaults-investing-bot-tx/ConnectionPool';
 import {
@@ -69,7 +75,7 @@ export class DangerCoordinator {
 
   constructor(
     private readonly dangerDetector: DangerDetector,
-    private readonly kaminoManager: KaminoManager,
+    private kaminoManager: KaminoManager,
     private readonly c: ConnectionPool,
     private readonly allocationAdmin: KeyPairSigner,
     deps: DangerCoordinatorDeps = {}
@@ -78,6 +84,10 @@ export class DangerCoordinator {
     this.fetchPrices = deps.fetchPrices ?? getTokensBatchPrice;
     this.fetchTokenFlags = deps.fetchTokenFlags ?? fetchTokenFlags;
     this.marketPriceMaxAgeSeconds = deps.marketPriceMaxAgeSeconds ?? DEFAULT_MARKET_PRICE_MAX_AGE_SECONDS;
+  }
+
+  updateKaminoManager(kaminoManager: KaminoManager): void {
+    this.kaminoManager = kaminoManager;
   }
 
   /**
@@ -159,7 +169,7 @@ export class DangerCoordinator {
       ...this.dangerDetector.getPriceReferenceMints(reserveMints, tokenFlags),
     ]);
     const dangerContext: TriggerContext = {
-      currentSlot: await this.kaminoManager.getRpc().getSlot().send(),
+      currentLedgerInstant: await getCurrentLedgerInstant(this.kaminoManager.getRpc()),
       marketPrices: await this.fetchPrices(Array.from(pricedMints), {
         requireAll: true,
         maxAgeSeconds: this.marketPriceMaxAgeSeconds,
@@ -194,9 +204,9 @@ export class DangerCoordinator {
         const vaultState = await kaminoVault.getState();
         const vaultHoldings = await this.kaminoManager.getVaultHoldings(
           vaultState,
-          dangerContext.currentSlot,
+          dangerContext.currentLedgerInstant,
           vaultsReserves,
-          dangerContext.currentSlot
+          dangerContext.currentLedgerInstant
         );
         const pendingEvacuations = this.dangerDetector.getPendingEvacuationReserves(vaultAddress);
 
@@ -269,7 +279,7 @@ export class DangerCoordinator {
               kaminoVault,
               pendingEvacuations,
               vaultsReserves,
-              dangerContext.currentSlot
+              dangerContext.currentLedgerInstant
             );
           } catch (e) {
             logger.error(`[danger-coordinator] error executing danger response for vault ${vaultAddress}: ${e}`);
@@ -294,7 +304,7 @@ export class DangerCoordinator {
               kaminoVault,
               pendingEvacuations,
               vaultsReserves,
-              dangerContext.currentSlot
+              dangerContext.currentLedgerInstant
             );
             const incompleteEvacuations = [...pendingEvacuations].filter(
               (reserve) => !completedEvacuations.has(reserve)
@@ -370,7 +380,7 @@ export class DangerCoordinator {
     kaminoVault: KaminoVault,
     pendingEvacuations: ReadonlySet<string>,
     vaultsReserves: Map<Address, KaminoReserve>,
-    currentSlot: Slot
+    currentLedgerInstant: LedgerInstant
   ): Promise<ReadonlySet<string>> {
     if (pendingEvacuations.size === 0) {
       return new Set();
@@ -380,9 +390,9 @@ export class DangerCoordinator {
     // weights and whether the refreshed cToken balance converts to zero versus a positive amount.
     const refreshedHoldings = await this.kaminoManager.getVaultHoldings(
       refreshedState,
-      currentSlot,
+      currentLedgerInstant,
       vaultsReserves,
-      currentSlot
+      currentLedgerInstant
     );
     const completed = new Set<string>();
     for (const reserveAddress of pendingEvacuations) {

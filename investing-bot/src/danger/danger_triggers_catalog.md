@@ -1,6 +1,6 @@
 # Danger Triggers Catalog
 
-## Catastrophic — Binary events requiring immediate pull-out
+## Catastrophic — Binary events requiring immediate pullout
 
 These are "it happened or it didn't" signals. When they fire, the reserve is compromised.
 
@@ -18,22 +18,22 @@ These are "it happened or it didn't" signals. When they fire, the reserve is com
 
 ## Slippery Slope — Potentially catastrophic, but gradual
 
-These worsen over time or with magnitude. They can independently trigger a pull-out if severe enough.
+These worsen over time or with magnitude. They can independently trigger pullout if severe enough.
 
 ### Supply APY Spike (implemented, transient)
 **Risk**: Supply APY above a sane ceiling indicates rate model manipulation, oracle issues, or an exploited reserve inflating apparent yields.
-**How to measure**: `reserve.totalSupplyAPY(currentSlot)`. Hard threshold: 20%.
-**Safety score**: Binary. APY ≤ 20% → 1.0. APY > 20% → 0.0. This causes an emergency pull-out and cooldown, not a permanent blacklist.
+**How to measure**: `reserve.totalSupplyAPY(currentLedgerInstant)`. Hard threshold: 20%.
+**Safety score**: Binary. APY ≤ 20% → 1.0. APY > 20% → 0.0. This causes an emergency pullout and cooldown, not a permanent blacklist.
 
 ### Insufficient Exit Liquidity (implemented)
 **Risk**: The reserve's available liquidity drops below a threshold relative to the vault's position, meaning the vault cannot fully exit if needed.
 **How to measure**: Compare `reserve.getLiquidityAvailableAmount()` against `vaultHoldings.investedInReserves.get(reserve)`.
-**Safety score**: Graduated. `ratio = availableLiquidity / vaultInvested`. Score = `clamp((ratio - 0.3) / 0.7, 0, 1)`. At 100% coverage → 1.0. At 65% → 0.5. At 30% or below → 0.0 (forces a pull-out for any risk appetite).
+**Safety score**: Graduated. `ratio = availableLiquidity / vaultInvested`. Score = `clamp((ratio - 0.3) / 0.7, 0, 1)`. At 100% coverage → 1.0. At 65% → 0.5. At 30% or below → 0.0 (forces pullout for any risk appetite).
 
 ### Oracle Price vs Market Price Divergence (Depeg) (implemented)
 **Risk**: The on-chain oracle price diverges from the market price (Kamino API), indicating a depeg or oracle manipulation.
 **How to measure**: Compare `reserve.tokenOraclePrice.price` against `getTokensBatchPrice()` result. Compute `divergencePercent = abs(oracle - market) / market * 100`.
-**Safety score**: Graduated, sqrt decay. Below 2% → 1.0. Formula: `divergence <= 2 ? 1.0 : max(0, 1 - sqrt((divergence - 2) / 8))`. At 5% → ~0.39. At 7% → ~0.21. At 10%+ → 0 (forces a pull-out for any risk appetite). Tight thresholds — even 5% divergence is unusual when both price sources are healthy.
+**Safety score**: Graduated, sqrt decay. Below 2% → 1.0. Formula: `divergence <= 2 ? 1.0 : max(0, 1 - sqrt((divergence - 2) / 8))`. At 5% → ~0.39. At 7% → ~0.21. At 10%+ → 0 (forces pullout for any risk appetite). Tight thresholds — even 5% divergence is unusual when both price sources are healthy.
 
 ### Secondary Market Depeg (implemented)
 **Risk**: The token loses its peg (e.g. USDC losing its dollar peg, an LST trading below the SOL backing it). This is the depeg the oracle-divergence trigger cannot see: when a peg genuinely breaks, the on-chain oracle tracks the market down with it, so the two prices agree while both sit well off the peg.
@@ -67,13 +67,12 @@ These worsen over time or with magnitude. They can independently trigger a pull-
 
 ## Red Flags — Risk multipliers that compound with other signals
 
-These primarily amplify other signals; whether one can trigger alone depends on its score and the
-selected risk appetite.
+These never justify pullout on their own, even in the worst case. They make other signals worse.
 
 ### Vault Is Dominant Depositor (implemented)
 **Risk**: The vault's deposit is a large fraction of the reserve's total supply. If the vault exits, it could cause a liquidity spiral.
 **How to measure**: `vaultHoldings.investedInReserves.get(reserve) / reserve.getEstimatedTotalSupply(slot, 0)`.
-**Safety score**: Graduated, piecewise linear, skewed so above 50% gets dangerous fast. ≤10% → 1.0 (safe). 10%→50% mild decay 1.0→0.7. 50%→90% steeper decay 0.7→0.3. ≥90% → 0.3 (floor). Sample: 30%→0.85, 50%→0.7, 70%→0.5, 90%→0.3. Floor 0.3 sits at the SENSIBLE threshold — never triggers a SENSIBLE/YOLO pull-out alone. PARANOID (0.5) can pull out alone above 70% dominance.
+**Safety score**: Graduated, piecewise linear, skewed so above 50% gets dangerous fast. ≤10% → 1.0 (safe). 10%→50% mild decay 1.0→0.7. 50%→90% steeper decay 0.7→0.3. ≥90% → 0.3 (floor). Sample: 30%→0.85, 50%→0.7, 70%→0.5, 90%→0.3. Floor 0.3 sits at the SENSIBLE threshold — never triggers SENSIBLE/YOLO pullout alone. PARANOID (0.5) can pull out alone above 70% dominance.
 **Configurable hard threshold**: `maxVaultDominanceBps`, set per allocation or per vault (the per-vault value wins), is the dominance at or above which the score is 0 — an emergency pull-out at any risk appetite. It is a step, not a rescaled curve: "leave above 60%" means exactly that, and the graduated red-flag score still compounds with the other triggers everywhere below it. Unset by default, so existing vaults keep the graduated behaviour above.
 
 ### Deposit/Withdrawal Cap Saturation (not implemented)
@@ -96,5 +95,24 @@ selected risk appetite.
 **How to measure**: Track `reserve.state.config` fields across iterations, trigger on unexpected changes.
 **Safety score**: Critical param change → 0.1. Non-critical → 0.5. No change → 1.0. Hard to distinguish legitimate governance from attacks — floor at 0.1 keeps it as a strong multiplier but not a standalone trigger.
 
-For an at-a-glance summary of implemented triggers and risk-appetite thresholds, see the
-[configuration reference](../../../docs/configuration.md#danger-trigger-catalog).
+---
+
+## Priority Matrix
+
+| Priority | Trigger | Category | Score Range | Alone Triggers Pullout? |
+|----------|---------|----------|-------------|------------------------|
+| 1 | Infinite Mint ✅ | Catastrophic | 0 or 1 | Yes |
+| 2 | Exchange Rate Anomaly ✅ | Catastrophic | 0 or 1 | Yes |
+| 3 | Supply APY Spike ✅ | Slippery Slope | 0 or 1 | Yes at >20% APY |
+| 4 | Insufficient Exit Liquidity ✅ | Slippery Slope | 0 – 1.0 | PARANOID <65%; SENSIBLE <51%; YOLO <37% coverage |
+| 5 | Oracle vs Market Divergence ✅ | Slippery Slope | 0 – 1.0 | PARANOID >4%; SENSIBLE >5.92%; YOLO >8.48% |
+| 6 | Secondary Market Depeg ✅ | Slippery Slope | 0 – 1.0 | $1: PARANOID >88bps; SENSIBLE >124bps; YOLO >172bps. LST: >3.25%/5.41%/8.29% discount |
+| 7 | Market Utilization ✅ | Slippery Slope | 0 – 1.0 | PARANOID >95%; SENSIBLE >97%; YOLO >99% utilization |
+| 8 | DEX Liquidity Drying Up | Not implemented | — | — |
+| 9 | Vault Is Dominant Depositor ✅ | Red Flag | 0 – 1.0 | PARANOID above 70%; any appetite at/above `maxVaultDominanceBps` when configured |
+| 10 | Deposit/Withdrawal Cap Sat. | Not implemented | — | — |
+| 11 | Abnormal Borrow Spike | Not implemented | — | — |
+| 12 | Oracle Price Stale | Not implemented separately | — | Invalid SDK oracle prices fail closed in the divergence trigger |
+| 13 | Protocol Governance Attack | Not implemented | — | — |
+
+**Catastrophic** triggers fire rarely but demand immediate action. **Slippery Slope** triggers can independently cause pullout if severe, and get worse over time. **Red Flags** only matter in combination — they make everything else worse but are never the sole reason to pull out.
