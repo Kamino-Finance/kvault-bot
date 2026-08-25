@@ -3,10 +3,11 @@ import {
   KaminoManager,
   KaminoReserve,
   KaminoVault,
+  LedgerInstant,
   ReserveAllocationConfig,
   ReserveWithAddress,
 } from '@kamino-finance/klend-sdk';
-import { Address, IInstruction, Slot, TransactionSigner } from '@solana/kit';
+import { Address, IInstruction, TransactionSigner } from '@solana/kit';
 import { logger } from 'kvaults-investing-bot-logger';
 import { AllocationWithAPY, AllocationWithAPYAndIxs } from '../utils/maxYieldOptimizers.js';
 import { computeOverallVaultAPYFromReservesMap } from '../utils/allocationHelper.js';
@@ -19,14 +20,19 @@ export async function getUnchangedAllocationRebalanceIxs(
   kaminoManager: KaminoManager,
   kaminoVault: KaminoVault,
   vaultsReserves: Map<Address, KaminoReserve>,
-  currentSlot: Slot,
+  currentLedgerInstant: LedgerInstant,
   compoundingPeriods: number = 1,
   verbose: boolean = false,
   allVaultReserves: Map<Address, KaminoReserve> = vaultsReserves,
   forcedZeroReserves: ReadonlySet<string> = new Set()
 ): Promise<AllocationWithAPYAndIxs> {
   const vaultState = await kaminoVault.getState();
-  const vaultHoldings = await kaminoManager.getVaultHoldings(vaultState, currentSlot, allVaultReserves, currentSlot);
+  const vaultHoldings = await kaminoManager.getVaultHoldings(
+    vaultState,
+    currentLedgerInstant,
+    allVaultReserves,
+    currentLedgerInstant
+  );
   const currentReservesAllocations = getReserveAllocationsForUniverse(vaultState, vaultsReserves);
   const bestAllocation: AllocationWithAPY = {
     reservesWithAllocation: currentReservesAllocations,
@@ -36,7 +42,7 @@ export async function getUnchangedAllocationRebalanceIxs(
       vaultHoldings.totalAUMIncludingFees.sub(vaultHoldings.pendingFees ?? 0),
       vaultHoldings.investedInReserves,
       vaultsReserves,
-      currentSlot,
+      currentLedgerInstant,
       compoundingPeriods,
       verbose,
       {
@@ -44,7 +50,7 @@ export async function getUnchangedAllocationRebalanceIxs(
         vaultAUMTokens: vaultHoldings.totalAUMIncludingFees.sub(vaultHoldings.pendingFees ?? 0),
         currentVaultAllocations: kaminoManager.getVaultAllocations(vaultState),
         allVaultReserves,
-        currentSlot,
+        currentLedgerInstant,
         forcedZeroReserves,
       }
     ),
@@ -58,7 +64,7 @@ export async function getFixedWeightsAllocationRebalanceIxs(
   vaultsReserves: Map<Address, KaminoReserve>,
   fixedReservesWeights: ReserveWeight[],
   signer: TransactionSigner,
-  currentSlot: Slot,
+  currentLedgerInstant: LedgerInstant,
   compoundingPeriods: number = 1,
   verbose: boolean = false,
   allVaultReserves: Map<Address, KaminoReserve> = vaultsReserves,
@@ -106,14 +112,19 @@ export async function getFixedWeightsAllocationRebalanceIxs(
     }
   }
 
-  const vaultHoldings = await kaminoManager.getVaultHoldings(vaultState, currentSlot, allVaultReserves, currentSlot);
+  const vaultHoldings = await kaminoManager.getVaultHoldings(
+    vaultState,
+    currentLedgerInstant,
+    allVaultReserves,
+    currentLedgerInstant
+  );
   bestAllocation.apy = computeOverallVaultAPYFromReservesMap(
     bestAllocation.reservesWithAllocation,
     getReserveAllocationsForUniverse(vaultState, vaultsReserves),
     vaultHoldings.totalAUMIncludingFees.sub(vaultHoldings.pendingFees ?? 0),
     vaultHoldings.investedInReserves,
     vaultsReserves,
-    currentSlot,
+    currentLedgerInstant,
     compoundingPeriods,
     verbose,
     {
@@ -121,7 +132,7 @@ export async function getFixedWeightsAllocationRebalanceIxs(
       vaultAUMTokens: vaultHoldings.totalAUMIncludingFees.sub(vaultHoldings.pendingFees ?? 0),
       currentVaultAllocations: kaminoManager.getVaultAllocations(vaultState),
       allVaultReserves,
-      currentSlot,
+      currentLedgerInstant,
       forcedZeroReserves,
     }
   );
@@ -133,7 +144,7 @@ export async function getEqualAllocationRebalanceIxs(
   kaminoVault: KaminoVault,
   vaultsReserves: Map<Address, KaminoReserve>,
   signer: TransactionSigner,
-  currentSlot: Slot,
+  currentLedgerInstant: LedgerInstant,
   compoundingPeriods: number = 1,
   verbose: boolean = false,
   allVaultReserves: Map<Address, KaminoReserve> = vaultsReserves,
@@ -141,7 +152,12 @@ export async function getEqualAllocationRebalanceIxs(
 ): Promise<AllocationWithAPYAndIxs> {
   const vaultState = await kaminoVault.getState();
   const reserves = getVaultReserveAddressesInUniverse(kaminoManager, vaultState, vaultsReserves);
-  const vaultHoldings = await kaminoManager.getVaultHoldings(vaultState, currentSlot, allVaultReserves, currentSlot);
+  const vaultHoldings = await kaminoManager.getVaultHoldings(
+    vaultState,
+    currentLedgerInstant,
+    allVaultReserves,
+    currentLedgerInstant
+  );
   const allocationRebalanceIxs: IInstruction[] = [];
   const bestAllocation: AllocationWithAPY = {
     reservesWithAllocation: new Map(),
@@ -180,7 +196,7 @@ export async function getEqualAllocationRebalanceIxs(
     vaultHoldings.totalAUMIncludingFees.sub(vaultHoldings.pendingFees ?? 0),
     vaultHoldings.investedInReserves,
     vaultsReserves,
-    currentSlot,
+    currentLedgerInstant,
     compoundingPeriods,
     verbose,
     {
@@ -188,7 +204,7 @@ export async function getEqualAllocationRebalanceIxs(
       vaultAUMTokens: vaultHoldings.totalAUMIncludingFees.sub(vaultHoldings.pendingFees ?? 0),
       currentVaultAllocations: kaminoManager.getVaultAllocations(vaultState),
       allVaultReserves,
-      currentSlot,
+      currentLedgerInstant,
       forcedZeroReserves,
     }
   );
@@ -200,7 +216,7 @@ export async function getRandomAllocationRebalanceIxs(
   kaminoVault: KaminoVault,
   vaultsReserves: Map<Address, KaminoReserve>,
   signer: TransactionSigner,
-  currentSlot: Slot,
+  currentLedgerInstant: LedgerInstant,
   compoundingPeriods: number = 1,
   verbose: boolean = false,
   allVaultReserves: Map<Address, KaminoReserve> = vaultsReserves,
@@ -208,7 +224,12 @@ export async function getRandomAllocationRebalanceIxs(
 ): Promise<AllocationWithAPYAndIxs> {
   const vaultState = await kaminoVault.getState();
   const reserves = getVaultReserveAddressesInUniverse(kaminoManager, vaultState, vaultsReserves);
-  const vaultHoldings = await kaminoManager.getVaultHoldings(vaultState, currentSlot, allVaultReserves, currentSlot);
+  const vaultHoldings = await kaminoManager.getVaultHoldings(
+    vaultState,
+    currentLedgerInstant,
+    allVaultReserves,
+    currentLedgerInstant
+  );
   const weights = reserves.map(() => Math.floor(Math.random() * 100_000) + 100);
   const allocationRebalanceIxs: IInstruction[] = [];
   const bestAllocation: AllocationWithAPY = {
@@ -250,7 +271,7 @@ export async function getRandomAllocationRebalanceIxs(
     vaultHoldings.totalAUMIncludingFees.sub(vaultHoldings.pendingFees ?? 0),
     vaultHoldings.investedInReserves,
     vaultsReserves,
-    currentSlot,
+    currentLedgerInstant,
     compoundingPeriods,
     verbose,
     {
@@ -258,7 +279,7 @@ export async function getRandomAllocationRebalanceIxs(
       vaultAUMTokens: vaultHoldings.totalAUMIncludingFees.sub(vaultHoldings.pendingFees ?? 0),
       currentVaultAllocations: kaminoManager.getVaultAllocations(vaultState),
       allVaultReserves,
-      currentSlot,
+      currentLedgerInstant,
       forcedZeroReserves,
     }
   );

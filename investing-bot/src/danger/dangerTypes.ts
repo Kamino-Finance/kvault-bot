@@ -1,5 +1,5 @@
-import { Address, Rpc, Slot, SolanaRpcApi } from '@solana/kit';
-import { KaminoReserve } from '@kamino-finance/klend-sdk';
+import { Address, Rpc, SolanaRpcApi } from '@solana/kit';
+import { KaminoReserve, LedgerInstant } from '@kamino-finance/klend-sdk';
 import { Decimal } from 'decimal.js';
 import { TokenFlags } from '../utils/tokenFlags.js';
 
@@ -23,7 +23,7 @@ export interface TriggerResult {
  * Context passed to each trigger check, providing shared on-chain state.
  */
 export interface TriggerContext {
-  currentSlot: Slot;
+  currentLedgerInstant: LedgerInstant;
   marketPrices: Map<Address, Decimal>; // mint -> market price (from off-chain price API)
   /**
    * Kamino's token-flags feed, keyed by mint: the authoritative answer to "is this a stablecoin / an

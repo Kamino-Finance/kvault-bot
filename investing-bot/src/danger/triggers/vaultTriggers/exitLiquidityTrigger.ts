@@ -31,7 +31,7 @@ export class ExitLiquidityTrigger implements VaultDangerTrigger {
     try {
       const decimals = reserve.state.liquidity.mintDecimals.toNumber();
       const availableLiquidity = lamportsToDecimal(
-        reserve.getFreelyAvailableLiquidityAmount(context.currentSlot).toString(),
+        reserve.getFreelyAvailableLiquidityAmount(context.currentLedgerInstant, 0).toString(),
         decimals
       );
       const liquidityRatio = availableLiquidity.div(vaultInvestedInReserve);

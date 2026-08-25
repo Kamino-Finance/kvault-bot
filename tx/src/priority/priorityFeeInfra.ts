@@ -1,4 +1,4 @@
-import { Address, GetSlotApi, Rpc } from '@solana/kit';
+import { Address, Rpc } from '@solana/kit';
 import { logger } from 'kvaults-investing-bot-logger';
 import { SOL, TokenAmount } from '../utils/index.js';
 import { AsyncLoadingSlot, TimeBasedReloadingSlot } from '../utils/caching.js';
@@ -112,10 +112,10 @@ export function createResilientPriorityFeeProvider(
  * A provider using the Triton's RPC customization (i.e. `percentile` param for `getRecentPrioritizationFees()`).
  */
 export class TritonPriorityFeeProvider implements PriorityFeeProvider {
-  private readonly tritonRpc: Rpc<GetSlotApi & GetRecentPrioritizationFeesPercentileApi>;
+  private readonly tritonRpc: Rpc<GetRecentPrioritizationFeesPercentileApi>;
   private readonly feePercentile: number;
 
-  constructor(tritonRpc: Rpc<GetSlotApi & GetRecentPrioritizationFeesPercentileApi>, feePercentile: number) {
+  constructor(tritonRpc: Rpc<GetRecentPrioritizationFeesPercentileApi>, feePercentile: number) {
     this.tritonRpc = tritonRpc;
     this.feePercentile = feePercentile;
   }

@@ -1,10 +1,8 @@
 import { Decimal } from 'decimal.js';
-import { GetSlotApi, Rpc } from '@solana/kit';
+import { Rpc } from '@solana/kit';
 import type { Address } from '@solana/addresses';
 import type { MicroLamports, Slot } from '@solana/rpc-types';
 import { logger } from 'kvaults-investing-bot-logger';
-
-const SLOTS_PER_MINUTE = BigInt((60 * 1000) / 400);
 
 export type RpcPriorityFees = {
   min: Decimal;
@@ -48,30 +46,21 @@ export type GetRecentPrioritizationFeesPercentileApi = {
  * @param percentile
  */
 export async function getRpcRecentFeesOfPercentile(
-  rpc: Rpc<GetRecentPrioritizationFeesPercentileApi & GetSlotApi>,
+  rpc: Rpc<GetRecentPrioritizationFeesPercentileApi>,
   addresses?: Address[],
   percentile?: PercentileConfig
 ): Promise<RpcPriorityFees> {
   const percentileStr = `${percentile ? ` P[${percentile.percentile / 100}]` : ''}`;
   const accStr = addresses?.length || 'all global';
   logger.info(`Fetching recent${percentileStr} priority fees from Triton for ${accStr} accounts`);
-  // todo maybe remove slot call here as it is done further up
-  const [res, slot] = await Promise.all([
-    rpc.getRecentPrioritizationFees(addresses, percentile).send(),
-    rpc.getSlot().send(),
-  ]);
-  const validSlot = slot - SLOTS_PER_MINUTE;
+  const res = await rpc.getRecentPrioritizationFees(addresses, percentile).send();
   let filteredZeros = 0;
-  let filteredOld = 0;
   let total = 0n;
+  // The RPC cache is block-count based. Use the complete cache instead of converting a time window to slots.
   const recentFees = res
     .filter((f) => {
       if (f.prioritizationFee <= 0) {
         filteredZeros++;
-        return false;
-      }
-      if (f.slot < validSlot) {
-        filteredOld++;
         return false;
       }
       total = total + f.prioritizationFee;
@@ -80,7 +69,7 @@ export async function getRpcRecentFeesOfPercentile(
     .sort((a, b) => Number(a.prioritizationFee - b.prioritizationFee));
   if (recentFees.length === 0) {
     logger.info(
-      `No valid 1 minute${percentileStr} priority fees returned from RPC for ${accStr} accounts, using 1 uLamports/CU. Filtered ${filteredZeros} zero fees and ${filteredOld} >1 minute fees`
+      `No non-zero recent${percentileStr} priority fees returned from RPC for ${accStr} accounts, using 1 uLamports/CU. Filtered ${filteredZeros} zero fees`
     );
     return {
       min: new Decimal('1'),
@@ -91,7 +80,7 @@ export async function getRpcRecentFeesOfPercentile(
   }
   if (recentFees.length === 1) {
     logger.info(
-      `Fetched 1 valid 1 minute${percentileStr} priority fee from Triton for ${accStr} accounts, fee: ${recentFees[0].prioritizationFee} uLamports/CU. Filtered ${filteredZeros} zero fees and ${filteredOld} >1 minute fees`
+      `Fetched 1 non-zero recent${percentileStr} priority fee from Triton for ${accStr} accounts, fee: ${recentFees[0].prioritizationFee} uLamports/CU. Filtered ${filteredZeros} zero fees`
     );
     return {
       min: new Decimal(recentFees[0].prioritizationFee.toString()),
@@ -105,7 +94,7 @@ export async function getRpcRecentFeesOfPercentile(
   const average = new Decimal((total / BigInt(recentFees.length)).toString());
   const median = new Decimal(recentFees[Math.floor(recentFees.length / 2)].prioritizationFee.toString());
   logger.info(
-    `Fetched ${recentFees.length} valid 1 minute${percentileStr} priority fees from Triton for ${accStr} accounts, median: ${median} uLamports/CU, average: ${average} uLamports/CU, min: ${min} uLamports/CU, max: ${max} uLamports/CU. Filtered ${filteredZeros} zero fees and ${filteredOld} >1 minute fees`
+    `Fetched ${recentFees.length} non-zero recent${percentileStr} priority fees from Triton for ${accStr} accounts, median: ${median} uLamports/CU, average: ${average} uLamports/CU, min: ${min} uLamports/CU, max: ${max} uLamports/CU. Filtered ${filteredZeros} zero fees`
   );
   return {
     min,

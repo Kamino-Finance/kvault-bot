@@ -1,8 +1,14 @@
 import { Decimal } from 'decimal.js';
 // Grid Search Allocation for APY (Exhaustive) for a Given Number of Markets
 
-import { KaminoManager, KaminoReserve, ReserveAllocationOverview, VaultState } from '@kamino-finance/klend-sdk';
-import { Address, IInstruction, Slot } from '@solana/kit';
+import {
+  KaminoManager,
+  KaminoReserve,
+  LedgerInstant,
+  ReserveAllocationOverview,
+  VaultState,
+} from '@kamino-finance/klend-sdk';
+import { Address, IInstruction } from '@solana/kit';
 import { logger } from 'kvaults-investing-bot-logger';
 import { Farms, FarmState } from '@kamino-finance/farms-sdk';
 import { withTimeout } from '../../utils/timeout.js';
@@ -403,7 +409,7 @@ export async function gridSearchAllocationForMaxApyCoarseToFine(
   reserves: Map<Address, KaminoReserve>,
   allocationWeightsSum: Decimal,
   requestedCoarseResolution: number,
-  currentSlot: Slot,
+  currentLedgerInstant: LedgerInstant,
   vaultAUMTokens: Decimal,
   investedInReservesTokens: Map<Address, Decimal>,
   shouldIncludeFarmRewards: boolean,
@@ -505,7 +511,7 @@ export async function gridSearchAllocationForMaxApyCoarseToFine(
           allocationWeightsSum,
           vaultAUMTokens,
           allInvestedInReservesTokens,
-          currentSlot,
+          currentLedgerInstant,
           compoundingPeriods,
           shouldIncludeFarmRewards,
           localFarmsClient,
@@ -573,7 +579,7 @@ export async function gridSearchAllocationForMinStabilizationFactorCoarseToFine(
   reserves: Map<Address, KaminoReserve>,
   allocationWeightsSum: Decimal,
   requestedCoarseResolution: number,
-  currentSlot: Slot,
+  currentLedgerInstant: LedgerInstant,
   vaultAUMTokens: Decimal,
   investedInReservesTokens: Map<Address, Decimal>,
   shouldIncludeFarmRewards: boolean,
@@ -666,7 +672,7 @@ export async function gridSearchAllocationForMinStabilizationFactorCoarseToFine(
           allocationWeightsSum,
           vaultAUMTokens,
           allInvestedInReservesTokens,
-          currentSlot,
+          currentLedgerInstant,
           compoundingPeriods,
           shouldIncludeFarmRewards,
           localFarmsClient,

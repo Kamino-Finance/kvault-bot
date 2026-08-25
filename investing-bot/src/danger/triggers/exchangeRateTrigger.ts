@@ -38,7 +38,7 @@ export class ExchangeRateTrigger implements DangerTrigger {
       // mintTotalSupply or totalSupply is zero, which MASKS the worst catastrophe: cTokens still
       // outstanding with zero liquidity backing them (a full drain / total loss of funds). Detect that
       // state directly from the raw supplies instead of trusting the clamped rate.
-      const totalSupply = reserve.getEstimatedTotalSupply(context.currentSlot, 0);
+      const totalSupply = reserve.getEstimatedTotalSupply(context.currentLedgerInstant, 0);
       const mintTotalSupply = new Decimal(reserve.state.collateral.mintTotalSupply.toString());
       if (totalSupply.lte(0) && mintTotalSupply.gt(0)) {
         const details = `reserve ${reserveKey} has ${mintTotalSupply.toString()} cTokens outstanding but zero liquidity backing — total loss of funds`;
@@ -46,7 +46,7 @@ export class ExchangeRateTrigger implements DangerTrigger {
         return { safetyScore: 0.0, triggerName: this.name, reserveAddress, details, catastrophic: true };
       }
 
-      const currentRate = reserve.getEstimatedCollateralExchangeRate(context.currentSlot, 0);
+      const currentRate = reserve.getEstimatedCollateralExchangeRate(context.currentLedgerInstant, 0);
       if (!currentRate.isFinite() || currentRate.lte(0)) {
         throw new Error(`invalid collateral exchange rate ${currentRate.toString()}`);
       }

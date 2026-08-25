@@ -1,6 +1,6 @@
 import { Decimal } from 'decimal.js';
-import { KaminoManager, KaminoReserve, KaminoVault, lamportsToDecimal } from '@kamino-finance/klend-sdk';
-import { Address, Slot } from '@solana/kit';
+import { KaminoManager, KaminoReserve, KaminoVault, lamportsToDecimal, LedgerInstant } from '@kamino-finance/klend-sdk';
+import { Address } from '@solana/kit';
 import { DEFAULT_PUBLIC_KEY } from 'kvaults-investing-bot-tx/instruction';
 import { Farms, FarmState } from '@kamino-finance/farms-sdk';
 import { AllocationWithAPY } from './maxYieldOptimizers.js';
@@ -16,14 +16,14 @@ import {
  * @param kaminoVault
  * @param vaultsReserves map from Address to the KaminoReserve state for all the reserves in the vault
  * @param allocation the new allocation
- * @param currentSlot
+ * @param currentLedgerInstant
  */
 export async function buildReservesAllocationLog(
   kaminoManager: KaminoManager,
   kaminoVault: KaminoVault,
   vaultsReserves: Map<Address, KaminoReserve>,
   allocation: AllocationWithAPY,
-  currentSlot: Slot,
+  currentLedgerInstant: LedgerInstant,
   shouldIncludeFarmRewards: boolean,
   farmsClient: Farms,
   farmsToFarmStateMap?: Map<Address, FarmState>,
@@ -33,7 +33,12 @@ export async function buildReservesAllocationLog(
 ): Promise<string> {
   const vaultState = await kaminoVault.getState(); // the vault state should have been already loaded so this shouldn't make any RPC calls
 
-  const vaultHoldings = await kaminoManager.getVaultHoldings(vaultState, currentSlot, allVaultReserves, currentSlot);
+  const vaultHoldings = await kaminoManager.getVaultHoldings(
+    vaultState,
+    currentLedgerInstant,
+    allVaultReserves,
+    currentLedgerInstant
+  );
   const investedInReservesTokens = vaultHoldings.investedInReserves;
   let logMsg = 'Reserves overview: ';
   const aumWithoutFeesTokens = vaultHoldings.totalAUMIncludingFees.sub(vaultHoldings.pendingFees ?? 0);
@@ -42,7 +47,7 @@ export async function buildReservesAllocationLog(
     vaultAUMTokens: aumWithoutFeesTokens,
     currentVaultAllocations: kaminoManager.getVaultAllocations(vaultState),
     allVaultReserves,
-    currentSlot,
+    currentLedgerInstant,
     forcedZeroReserves,
   });
   for (const reserveAlloc of vaultState.vaultAllocationStrategy) {
@@ -57,7 +62,7 @@ export async function buildReservesAllocationLog(
     const toInvestInReserveTokens =
       targetAllocation.targetReservesAllocation.get(reserveAlloc.reserve) ?? new Decimal(0);
 
-    const reserveCollExchangeRate = kReserve.getEstimatedCollateralExchangeRate(currentSlot, 0);
+    const reserveCollExchangeRate = kReserve.getEstimatedCollateralExchangeRate(currentLedgerInstant, 0);
     const reserveAllocationLiquidityAmountLamports = new Decimal(reserveAlloc.ctokenAllocation.toString()).div(
       reserveCollExchangeRate
     );
@@ -67,7 +72,7 @@ export async function buildReservesAllocationLog(
     );
 
     const totalSupplyTokens = lamportsToDecimal(
-      kReserve.getEstimatedTotalSupply(currentSlot, 0),
+      kReserve.getEstimatedTotalSupply(currentLedgerInstant, 0),
       vaultState.tokenMintDecimals.toNumber()
     );
 
@@ -75,7 +80,7 @@ export async function buildReservesAllocationLog(
       kReserve,
       toInvestInReserveTokens,
       investedInReservesTokens.get(kReserve.address)!,
-      currentSlot,
+      currentLedgerInstant,
       1
     );
 
@@ -92,7 +97,7 @@ export async function buildReservesAllocationLog(
     }
     const totalSimulatedApy = simulatedReserveSupplyApy.add(simulatedReserveSupplyFarmAPY);
 
-    const reserveLogMsg = `${kReserve.address.toString()}; total_supplied_tokens: ${totalSupplyTokens.toString()}; total_borrowed_tokens: ${kReserve.getBorrowTvl()}; current_apy: ${kReserve.totalSupplyAPY(currentSlot)}; simulated_supply_apy_with_new_allocation: ${simulatedReserveSupplyApy.toString()}; simulated_farm_apy_with_new_allocation: ${simulatedReserveSupplyFarmAPY.toString()}; total_simulated_apy_with_new_allocation: ${totalSimulatedApy.toString()}; to_supply_in_reserve: ${toInvestInReserveTokens} currently_supplied_in_vault: ${reserveAllocationLiquidityAmountTokens};`;
+    const reserveLogMsg = `${kReserve.address.toString()}; total_supplied_tokens: ${totalSupplyTokens.toString()}; total_borrowed_tokens: ${kReserve.getBorrowTvl()}; current_apy: ${kReserve.totalSupplyAPY(currentLedgerInstant)}; simulated_supply_apy_with_new_allocation: ${simulatedReserveSupplyApy.toString()}; simulated_farm_apy_with_new_allocation: ${simulatedReserveSupplyFarmAPY.toString()}; total_simulated_apy_with_new_allocation: ${totalSimulatedApy.toString()}; to_supply_in_reserve: ${toInvestInReserveTokens} currently_supplied_in_vault: ${reserveAllocationLiquidityAmountTokens};`;
     logMsg += reserveLogMsg;
   }
   return logMsg;

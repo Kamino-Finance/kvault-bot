@@ -30,7 +30,7 @@ export class DominantDepositorTrigger implements VaultDangerTrigger {
   readonly name = 'dominant-depositor';
 
   async check(_rpc: Rpc<SolanaRpcApi>, reserveAddress: Address, reserve: KaminoReserve, context: VaultTriggerContext) {
-    const { vaultInvestedInReserve, currentSlot } = context;
+    const { vaultInvestedInReserve, currentLedgerInstant } = context;
 
     if (vaultInvestedInReserve.lte(0)) {
       return {
@@ -43,7 +43,10 @@ export class DominantDepositorTrigger implements VaultDangerTrigger {
 
     try {
       const decimals = reserve.state.liquidity.mintDecimals.toNumber();
-      const totalSupply = lamportsToDecimal(reserve.getEstimatedTotalSupply(currentSlot, 0).toString(), decimals);
+      const totalSupply = lamportsToDecimal(
+        reserve.getEstimatedTotalSupply(currentLedgerInstant, 0).toString(),
+        decimals
+      );
 
       if (totalSupply.lte(0)) {
         // Reserve has no supply but vault has a position — treat as 100% dominance, which also trips

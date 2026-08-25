@@ -1,10 +1,10 @@
 import { Decimal } from 'decimal.js';
 import {
   getAtasWithCreateIxsIfMissing,
+  getCurrentLedgerInstant,
   KaminoManager,
   KaminoVault,
   lamportsToDecimal,
-  SLOTS_PER_SECOND,
 } from '@kamino-finance/klend-sdk';
 import { Address, createKeyPairSignerFromBytes, lamports } from '@solana/kit';
 import { TOKEN_PROGRAM_ADDRESS } from '@solana-program/token';
@@ -26,15 +26,25 @@ import { RPC_REQUEST_TIMEOUT_MS, withTimeout } from './utils/timeout.js';
 import { loadVaultsReservesInBatches } from './utils/vaultReserves.js';
 import { getTokensBatchPrice } from './utils/price.js';
 import { interruptibleSleep, LoopHeartbeat } from './utils/loop.js';
-import { createLoopContext } from './utils/loopContext.js';
+import { createLoopContext, KaminoManagerRefreshCoordinator } from './utils/loopContext.js';
 import { sendInstructionBatches } from './utils/sendInstructionBatches.js';
 import { shouldBlockVaultInvestmentForDanger } from './danger/vaultExposure.js';
+import { getMinimumSlotsForDurationSeconds } from './utils/solanaUtils.js';
 
 const VAULT_FETCH_BATCH_SIZE = 25;
 const CONFIG_MIN_SLOT_BYPASS_VAULT = '4TwKA9JXEGeLEpAPLoarhSQoQwoiu12dkDCjSuVvHQUf';
 export async function runInvestLoop(cluster: Cluster, heartbeat?: LoopHeartbeat) {
   logger.info('✅ running investing loop');
-  const { envConfig, connectionPool: c, kaminoManager } = await createLoopContext(cluster);
+  const {
+    envConfig,
+    connectionPool: c,
+    kaminoManager: initialKaminoManager,
+    refreshKaminoManager,
+  } = await createLoopContext(cluster);
+  const kaminoManagerRefreshCoordinator = new KaminoManagerRefreshCoordinator(
+    initialKaminoManager,
+    refreshKaminoManager
+  );
 
   const investor = await createKeyPairSignerFromBytes(
     Buffer.from(JSON.parse(readSecret('investor_keypair', 'INVESTOR_SECRET_PATH')))
@@ -49,11 +59,15 @@ export async function runInvestLoop(cluster: Cluster, heartbeat?: LoopHeartbeat)
   const vaultOwnersPubkeys = envConfig.investVaultOwners;
 
   for (let i = 0; ; i += 1) {
+    let recomputedVaultAllocation = false;
+
     // Check for shutdown at the beginning of each iteration
     if (isProcessShuttingDown()) {
       logger.info('[investing-loop] Shutdown requested, exiting loop...');
       return;
     }
+    await kaminoManagerRefreshCoordinator.refreshIfDue();
+    const kaminoManager = kaminoManagerRefreshCoordinator.getKaminoManager();
 
     // reload vaults every loop as the owners may have new vaults
     let vaultsPubkeys = [...baseVaultsPubkeys];
@@ -227,10 +241,10 @@ export async function runInvestLoop(cluster: Cluster, heartbeat?: LoopHeartbeat)
       '[investing-loop] load vault reserves',
       heartbeat
     );
-    const currentSlot = await withTimeout(
-      c.getRpc().getSlot().send(),
+    const currentLedgerInstant = await withTimeout(
+      getCurrentLedgerInstant(c.getRpc()),
       RPC_REQUEST_TIMEOUT_MS,
-      '[investing-loop] get current slot'
+      '[investing-loop] get current ledger instant'
     );
     heartbeat?.();
 
@@ -252,7 +266,7 @@ export async function runInvestLoop(cluster: Cluster, heartbeat?: LoopHeartbeat)
       const vaultReservesPubkeys = kaminoManager.getVaultReserves(vaultState);
 
       const vaultHoldings = await withTimeout(
-        kaminoManager.getVaultHoldings(vaultState, currentSlot, vaultsReserves, currentSlot),
+        kaminoManager.getVaultHoldings(vaultState, currentLedgerInstant, vaultsReserves, currentLedgerInstant),
         RPC_REQUEST_TIMEOUT_MS,
         `[investing-loop] get vault holdings ${vault.address}`
       );
@@ -273,10 +287,16 @@ export async function runInvestLoop(cluster: Cluster, heartbeat?: LoopHeartbeat)
       }
       // TODO: also consider amount to remain uninvested after it is released
       const theoreticalComputedAllocation = await withTimeout(
-        kaminoManager.getVaultComputedReservesAllocation(vaultState, currentSlot, vaultsReserves, currentSlot),
+        kaminoManager.getVaultComputedReservesAllocation(
+          vaultState,
+          currentLedgerInstant,
+          vaultsReserves,
+          currentLedgerInstant
+        ),
         RPC_REQUEST_TIMEOUT_MS,
         `[investing-loop] get computed allocation ${vault.address}`
       );
+      recomputedVaultAllocation = true;
 
       // for each reserve compute the diffTokens between holdings and theoretical allocation and sum the net diffTokens
       let totalDiffTokens = new Decimal(0);
@@ -296,7 +316,10 @@ export async function runInvestLoop(cluster: Cluster, heartbeat?: LoopHeartbeat)
           // if it is negative we need to disinvest and invest in another reserve but as we count what we will invest (positive) we don't also count the disinvested
           const diffTokens = allocation.minus(currentHoldingForReserveTokens);
           const reserveState = vaultsReserves.get(reserve)!;
-          const reserveAvailableLiquidityLamports = reserveState.getFreelyAvailableLiquidityAmount(currentSlot);
+          const reserveAvailableLiquidityLamports = reserveState.getFreelyAvailableLiquidityAmount(
+            currentLedgerInstant,
+            0
+          );
           const reserveAvailableLiquidityTokens = reserveAvailableLiquidityLamports.div(
             new Decimal(10).pow(reserveState.state.liquidity.mintDecimals.toNumber())
           );
@@ -333,13 +356,16 @@ export async function runInvestLoop(cluster: Cluster, heartbeat?: LoopHeartbeat)
       // check if we should invest based on time
       let latestInvestedSlot = new Decimal(0);
       vaultState.vaultAllocationStrategy.forEach((allocation) => {
-        const currentSlot = new Decimal(allocation.lastInvestSlot.toString());
-        if (currentSlot.gt(latestInvestedSlot)) {
-          latestInvestedSlot = currentSlot;
+        const allocationLastInvestSlot = new Decimal(allocation.lastInvestSlot.toString());
+        if (allocationLastInvestSlot.gt(latestInvestedSlot)) {
+          latestInvestedSlot = allocationLastInvestSlot;
         }
       });
-      const slotsFromLastInvest = new Decimal(currentSlot.toString()).minus(latestInvestedSlot);
-      const configMinSlotsSinceLastInvest = new Decimal(envConfig.minSecondsSinceLastInvest).mul(SLOTS_PER_SECOND + 1); // as we have more than 2
+      const slotsFromLastInvest = new Decimal(currentLedgerInstant.slot.toString()).minus(latestInvestedSlot);
+      const configMinSlotsSinceLastInvest = getMinimumSlotsForDurationSeconds(
+        envConfig.minSecondsSinceLastInvest,
+        kaminoManager.recentSlotDurationMs
+      );
       const vaultMinInvestDelaySlots = new Decimal(vaultState.minInvestDelaySlots.toString());
 
       if (slotsFromLastInvest.lessThan(configMinSlotsSinceLastInvest) && !shouldBypassConfigMinSlot) {
@@ -367,7 +393,7 @@ export async function runInvestLoop(cluster: Cluster, heartbeat?: LoopHeartbeat)
           }
         }
         const investIxs = await withTimeout(
-          kaminoManager.investAllReservesIxs(investor, vault, currentSlot),
+          kaminoManager.investAllReservesIxs(investor, vault, currentLedgerInstant),
           RPC_REQUEST_TIMEOUT_MS,
           `[investing-loop] build invest instructions ${vault.address}`
         );
@@ -391,12 +417,18 @@ export async function runInvestLoop(cluster: Cluster, heartbeat?: LoopHeartbeat)
       }
     }
 
+    await kaminoManagerRefreshCoordinator.completeWorkCycle(recomputedVaultAllocation);
+
     // Yield to event loop before sleeping
     await new Promise((resolve) => setImmediate(resolve));
 
     // sleep
-    logger.info(`[investing-loop] sleeping for ${envConfig.loopIntervalMs / 1000} seconds`);
-    const shouldExit = await interruptibleSleep(envConfig.loopIntervalMs, heartbeat);
+    const sleepMilliseconds = Math.min(
+      envConfig.loopIntervalMs,
+      kaminoManagerRefreshCoordinator.millisecondsUntilRefresh()
+    );
+    logger.info(`[investing-loop] sleeping for ${sleepMilliseconds / 1000} seconds`);
+    const shouldExit = await interruptibleSleep(sleepMilliseconds, heartbeat);
     if (shouldExit) {
       logger.info('[investing-loop] Shutdown requested during loop sleep, exiting...');
       return;

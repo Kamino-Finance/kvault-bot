@@ -1,6 +1,5 @@
-import { KaminoManager, KaminoReserve, KaminoVault } from '@kamino-finance/klend-sdk';
+import { getCurrentLedgerInstant, KaminoManager, KaminoReserve, KaminoVault } from '@kamino-finance/klend-sdk';
 import { address, Address, createKeyPairSignerFromBytes, IInstruction, KeyPairSigner } from '@solana/kit';
-import { fetchSysvarClock } from '@solana/sysvars';
 
 import { logger } from 'kvaults-investing-bot-logger';
 import { ConnectionPool } from 'kvaults-investing-bot-tx/ConnectionPool';
@@ -35,7 +34,7 @@ import { DangerAssessmentResult, DangerCoordinator } from './danger/dangerCoordi
 import { RPC_REQUEST_TIMEOUT_MS, withTimeout } from './utils/timeout.js';
 import { loadVaultsReservesInBatches } from './utils/vaultReserves.js';
 import { interruptibleSleep, LoopHeartbeat } from './utils/loop.js';
-import { createLoopContext } from './utils/loopContext.js';
+import { createLoopContext, KaminoManagerRefreshCoordinator } from './utils/loopContext.js';
 import { isProcessShuttingDown } from './utils/shutdown.js';
 import { sendInstructionBatches } from './utils/sendInstructionBatches.js';
 
@@ -45,7 +44,7 @@ async function heartbeatSleepSeconds(seconds: number, heartbeat?: LoopHeartbeat)
 
 export async function runAllocationLoop(cluster: Cluster, heartbeat?: LoopHeartbeat) {
   logger.info('[allocation-rebalance-loop] ✅ running allocation loop');
-  const { envConfig, connectionPool: c, kaminoManager } = await createLoopContext(cluster);
+  const { envConfig, connectionPool: c, kaminoManager, refreshKaminoManager } = await createLoopContext(cluster);
 
   const allocationsConfig: AllocationsConfig = readAllocationsConfig(envConfig.allocationConfigPath);
   printAllocationsConfig(allocationsConfig);
@@ -64,21 +63,23 @@ export async function runAllocationLoop(cluster: Cluster, heartbeat?: LoopHeartb
     envConfig.allocationDryRun,
     envConfig.blacklistPath,
     envConfig.marketPriceMaxAgeSeconds,
-    heartbeat
+    heartbeat,
+    refreshKaminoManager
   );
 }
 
 export async function runAllocationRebalanceLoop(
   allocationsConfig: AllocationsConfig,
   c: ConnectionPool,
-  kaminoManager: KaminoManager,
+  initialKaminoManager: KaminoManager,
   allocationAdmin: KeyPairSigner,
   gridSearchResolution: number,
   verbose: boolean,
   dryRun: boolean,
   blacklistPath: string,
   marketPriceMaxAgeSeconds: number,
-  heartbeat?: LoopHeartbeat
+  heartbeat?: LoopHeartbeat,
+  refreshKaminoManager?: () => Promise<KaminoManager>
 ) {
   // the min loop duration in the config which will determine how often the loop will run
   let minSecondsLoopDuration = Number.MAX_VALUE;
@@ -123,12 +124,27 @@ export async function runAllocationRebalanceLoop(
     });
 
     const dangerDetector = new DangerDetector(undefined, undefined, blacklistPath);
-    const dangerCoordinator = new DangerCoordinator(dangerDetector, kaminoManager, c, allocationAdmin, {
+    const dangerCoordinator = new DangerCoordinator(dangerDetector, initialKaminoManager, c, allocationAdmin, {
       marketPriceMaxAgeSeconds,
     });
+    const kaminoManagerRefreshCoordinator = refreshKaminoManager
+      ? new KaminoManagerRefreshCoordinator(initialKaminoManager, refreshKaminoManager, [dangerCoordinator])
+      : undefined;
+    const sleepUntilNextIteration = () => {
+      const configuredSleepMilliseconds = minSecondsLoopDuration * 1000;
+      const sleepMilliseconds = kaminoManagerRefreshCoordinator
+        ? Math.min(configuredSleepMilliseconds, kaminoManagerRefreshCoordinator.millisecondsUntilRefresh())
+        : configuredSleepMilliseconds;
+      logger.info(`[allocation-rebalance-loop] sleeping for ${sleepMilliseconds / 1000} seconds`);
+      return interruptibleSleep(sleepMilliseconds, heartbeat);
+    };
     let hasOperationalCheckpoint = false;
 
     while (!isProcessShuttingDown()) {
+      let recomputedVaultApy = false;
+      await kaminoManagerRefreshCoordinator?.refreshIfDue();
+      const kaminoManager = kaminoManagerRefreshCoordinator?.getKaminoManager() ?? initialKaminoManager;
+
       // Yield at start of each main loop iteration
       await new Promise((resolve) => setImmediate(resolve));
       if (hasOperationalCheckpoint) {
@@ -224,7 +240,7 @@ export async function runAllocationRebalanceLoop(
         // transient error does not blind the catastrophic triggers on the next pass (a full loop
         // restart would, by reconstructing the detector from scratch).
         logger.error(`[allocation-rebalance-loop] Danger detection failed; skipping rebalance this iteration: ${e}`);
-        if (await heartbeatSleepSeconds(minSecondsLoopDuration, heartbeat)) {
+        if (await sleepUntilNextIteration()) {
           return;
         }
         continue;
@@ -346,6 +362,7 @@ export async function runAllocationRebalanceLoop(
           const shouldRebalance = timestampInSeconds - lastRebalanceTimestamp > rebalanceFrequencySeconds;
 
           if (shouldRebalance || dryRun || getAllocationDryRun(allocation, vaultEntry)) {
+            recomputedVaultApy = true;
             const kaminoVault = kaminoVaultsMap.get(address(vaultAddress))!;
             const vaultState = await kaminoVault.getState();
 
@@ -353,17 +370,11 @@ export async function runAllocationRebalanceLoop(
             await new Promise((resolve) => setImmediate(resolve));
 
             // Call rebalanceAllocation with the appropriate parameters based on vault type
-            const currentSlot = await withTimeout(
-              kaminoManager.getRpc().getSlot().send(),
+            const currentLedgerInstant = await withTimeout(
+              getCurrentLedgerInstant(kaminoManager.getRpc()),
               RPC_REQUEST_TIMEOUT_MS,
-              `[allocation-rebalance-loop] get current slot ${vaultAddress}`
+              `[allocation-rebalance-loop] get current ledger instant ${vaultAddress}`
             );
-            const currentClock = await withTimeout(
-              fetchSysvarClock(kaminoManager.getRpc()),
-              RPC_REQUEST_TIMEOUT_MS,
-              '[allocation-rebalance-loop] fetch clock sysvar'
-            );
-            const currentUnixTimestamp = Number(currentClock.unixTimestamp);
 
             // Extract fixed reserves weights for FIXED_WEIGHTS strategy
             let fixedReservesWeights: ReserveWeight[] | undefined;
@@ -385,8 +396,7 @@ export async function runAllocationRebalanceLoop(
                 vaultsReserves,
                 strategy: vaultStrategy,
                 signer: allocationAdmin,
-                currentSlot,
-                currentUnixTimestamp,
+                currentLedgerInstant,
                 gridSearchResolution,
                 shouldIncludeFarmRewards,
                 fixedReservesConfig: getFixedReservesWithConfig(vaultEntry),
@@ -469,13 +479,13 @@ export async function runAllocationRebalanceLoop(
                 RPC_REQUEST_TIMEOUT_MS,
                 `[allocation-rebalance-loop] reload vault ${vaultAddress}`
               );
-              const investSlot = await withTimeout(
-                kaminoManager.getRpc().getSlot().send(),
+              const investLedgerInstant = await withTimeout(
+                getCurrentLedgerInstant(kaminoManager.getRpc()),
                 RPC_REQUEST_TIMEOUT_MS,
-                `[allocation-rebalance-loop] get invest slot ${vaultAddress}`
+                `[allocation-rebalance-loop] get invest ledger instant ${vaultAddress}`
               );
               const investIxs = await withTimeout(
-                kaminoManager.investAllReservesIxs(allocationAdmin, kaminoVault, investSlot),
+                kaminoManager.investAllReservesIxs(allocationAdmin, kaminoVault, investLedgerInstant),
                 RPC_REQUEST_TIMEOUT_MS,
                 `[allocation-rebalance-loop] build invest instructions ${vaultAddress}`
               );
@@ -511,8 +521,9 @@ export async function runAllocationRebalanceLoop(
         global.gc();
       }
 
-      logger.info(`[allocation-rebalance-loop] sleeping for ${minSecondsLoopDuration} seconds`);
-      if (await heartbeatSleepSeconds(minSecondsLoopDuration, heartbeat)) {
+      await kaminoManagerRefreshCoordinator?.completeWorkCycle(recomputedVaultApy);
+
+      if (await sleepUntilNextIteration()) {
         return;
       }
     }
