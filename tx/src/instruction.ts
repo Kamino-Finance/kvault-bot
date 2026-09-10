@@ -420,7 +420,10 @@ async function forceGetConfirmedTx(rpc: Rpc<GetTransactionApi>, sig: Signature):
       failedTx = await rpc
         .getTransaction(sig, {
           commitment: 'confirmed',
-          maxSupportedTransactionVersion: 0,
+          // Reading a v1 transaction fails outright unless the call asks for 1.
+          // @solana/kit 2.3 types this field as `'legacy' | 0`, from before
+          // transaction v1 existed, so the value needs a cast to reach the wire.
+          maxSupportedTransactionVersion: 1 as unknown as 0,
           encoding: 'json',
         })
         .send();
