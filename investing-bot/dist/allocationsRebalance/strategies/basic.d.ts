@@ -1,0 +1,9 @@
+import { KaminoManager, KaminoReserve, KaminoVault, LedgerInstant } from '@kamino-finance/klend-sdk';
+import { Address, TransactionSigner } from '@solana/kit';
+import { AllocationWithAPYAndIxs } from '../utils/maxYieldOptimizers.js';
+import { ReserveWeight } from '../rebalanceConfig.js';
+export declare function getUnchangedAllocationRebalanceIxs(kaminoManager: KaminoManager, kaminoVault: KaminoVault, vaultsReserves: Map<Address, KaminoReserve>, currentLedgerInstant: LedgerInstant, compoundingPeriods?: number, verbose?: boolean, allVaultReserves?: Map<Address, KaminoReserve>, forcedZeroReserves?: ReadonlySet<string>): Promise<AllocationWithAPYAndIxs>;
+export declare function getFixedWeightsAllocationRebalanceIxs(kaminoManager: KaminoManager, kaminoVault: KaminoVault, vaultsReserves: Map<Address, KaminoReserve>, fixedReservesWeights: ReserveWeight[], signer: TransactionSigner, currentLedgerInstant: LedgerInstant, compoundingPeriods?: number, verbose?: boolean, allVaultReserves?: Map<Address, KaminoReserve>, forcedZeroReserves?: ReadonlySet<string>): Promise<AllocationWithAPYAndIxs>;
+export declare function getEqualAllocationRebalanceIxs(kaminoManager: KaminoManager, kaminoVault: KaminoVault, vaultsReserves: Map<Address, KaminoReserve>, signer: TransactionSigner, currentLedgerInstant: LedgerInstant, compoundingPeriods?: number, verbose?: boolean, allVaultReserves?: Map<Address, KaminoReserve>, forcedZeroReserves?: ReadonlySet<string>): Promise<AllocationWithAPYAndIxs>;
+export declare function getRandomAllocationRebalanceIxs(kaminoManager: KaminoManager, kaminoVault: KaminoVault, vaultsReserves: Map<Address, KaminoReserve>, signer: TransactionSigner, currentLedgerInstant: LedgerInstant, compoundingPeriods?: number, verbose?: boolean, allVaultReserves?: Map<Address, KaminoReserve>, forcedZeroReserves?: ReadonlySet<string>): Promise<AllocationWithAPYAndIxs>;
+//# sourceMappingURL=basic.d.ts.map

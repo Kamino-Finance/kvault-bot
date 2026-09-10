@@ -1,0 +1,1 @@
+{"version":3,"file":"shutdown.js","sourceRoot":"","sources":["../../src/utils/shutdown.ts"],"names":[],"mappings":"AAAA,IAAI,mBAAmB,GAAG,KAAK,CAAC;AAEhC,MAAM,UAAU,qBAAqB;IACnC,OAAO,mBAAmB,CAAC;AAC7B,CAAC;AAED,MAAM,UAAU,uBAAuB;IACrC,mBAAmB,GAAG,IAAI,CAAC;AAC7B,CAAC"}

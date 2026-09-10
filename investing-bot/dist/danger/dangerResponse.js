@@ -1,0 +1,86 @@
+import { getCurrentLedgerInstant, ReserveAllocationConfig, sleep, } from '@kamino-finance/klend-sdk';
+import { logger } from 'kvaults-investing-bot-logger';
+import { DEFAULT_PUBLIC_KEY } from 'kvaults-investing-bot-tx/instruction';
+import { getLut } from '../libs/lut.js';
+import { getAllocationCapInTokensOrDefault, shouldUpdateAllocation } from '../allocationsRebalance/vaultUtils.js';
+import { sendInstructionBatches } from '../utils/sendInstructionBatches.js';
+/**
+ * Execute emergency deinvestment for a vault: zero the allocation weight while
+ * preserving the configured cap for all dangerous reserves, then trigger invest.
+ */
+export async function executeDangerResponse(dangerousReserveAddresses, kaminoManager, kaminoVault, vaultsReservesMap, allocationAdmin, c, deps = {}) {
+    const delay = deps.delay ?? sleep;
+    const vaultState = await kaminoVault.getState();
+    const vaultReserves = kaminoManager.getVaultReserves(vaultState);
+    // Filter to only reserves that belong to this vault AND are flagged dangerous
+    const dangerousVaultReserves = vaultReserves.filter((r) => dangerousReserveAddresses.has(r.toString()));
+    if (dangerousVaultReserves.length === 0)
+        return;
+    logger.error(`[danger-response] EMERGENCY: zeroing allocation for ${dangerousVaultReserves.length} reserve(s) in vault ${kaminoVault.address}`);
+    // Build zero-allocation instructions
+    const zeroAllocIxs = [];
+    for (const reserveAddr of dangerousVaultReserves) {
+        const reserveState = vaultsReservesMap.get(reserveAddr);
+        if (!reserveState)
+            continue;
+        const reserveWithAddress = {
+            address: reserveAddr,
+            state: reserveState.state,
+        };
+        const allocationCapTokens = getAllocationCapInTokensOrDefault(vaultState, reserveAddr);
+        const zeroConfig = new ReserveAllocationConfig(reserveWithAddress, 0, allocationCapTokens);
+        if (!shouldUpdateAllocation(vaultState, zeroConfig)) {
+            logger.info(`[danger-response] Reserve ${reserveAddr} already at zero allocation, skipping`);
+            continue;
+        }
+        const updateIxs = await kaminoManager.updateVaultReserveAllocationIxs(kaminoVault, zeroConfig, allocationAdmin);
+        zeroAllocIxs.push(updateIxs.updateReserveAllocationIx);
+        logger.error(`[danger-response] Reserve ${reserveAddr} allocation will be zeroed`);
+    }
+    // Get LUT if available
+    const luts = [];
+    if (vaultState.vaultLookupTable !== DEFAULT_PUBLIC_KEY) {
+        const lutState = await getLut(c.getRpc(), vaultState.vaultLookupTable);
+        luts.push(lutState);
+    }
+    // Send allocation-zeroing txs in batches of 2
+    await sendInstructionBatches({
+        connectionPool: c,
+        payer: allocationAdmin,
+        instructions: zeroAllocIxs,
+        lookupTables: luts,
+        signers: [allocationAdmin],
+        description: 'danger-response zero allocation',
+        batchSize: 2,
+        options: { reportSample: true, sendIfSimulationFailed: true },
+        sendTx: deps.sendTx,
+    });
+    // Reload state and trigger deinvest
+    await delay(5000);
+    await kaminoVault.reloadState();
+    const currentLedgerInstant = await getCurrentLedgerInstant(kaminoManager.getRpc());
+    const investIxs = await kaminoManager.investAllReservesIxs(allocationAdmin, kaminoVault, currentLedgerInstant, true);
+    await sendInstructionBatches({
+        connectionPool: c,
+        payer: allocationAdmin,
+        instructions: investIxs,
+        lookupTables: luts,
+        signers: [allocationAdmin],
+        description: 'danger-response emergency deinvest',
+        batchSize: 2,
+        options: { reportSample: true, sendIfSimulationFailed: true },
+        sendTx: deps.sendTx,
+    });
+    if (investIxs.length > 0) {
+        // The caller verifies whether the evacuation completed from this cached state.
+        // Refresh after the confirmed deinvest so it does not observe the pre-deinvest cToken balance.
+        await kaminoVault.reloadState();
+    }
+    if (zeroAllocIxs.length === 0 && investIxs.length === 0) {
+        logger.error(`[danger-response] No emergency deinvest ixs to send for vault ${kaminoVault.address}`);
+    }
+    else {
+        logger.error(`[danger-response] Emergency deinvest confirmed for vault ${kaminoVault.address}: ${zeroAllocIxs.length} zero-allocation + ${investIxs.length} deinvest ix(s).`);
+    }
+}
+//# sourceMappingURL=dangerResponse.js.map

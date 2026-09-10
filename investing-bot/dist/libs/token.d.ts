@@ -1,0 +1,3 @@
+import { Address, GetMinimumBalanceForRentExemptionApi, IInstruction, Lamports, Rpc, TransactionSigner } from '@solana/kit';
+export declare function createTokenAccountInstructions(rpc: Rpc<GetMinimumBalanceForRentExemptionApi>, newAccount: TransactionSigner, mint: Address, owner: TransactionSigner, tokenProgram: Address, lamports?: Lamports): Promise<IInstruction[]>;
+//# sourceMappingURL=token.d.ts.map

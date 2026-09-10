@@ -1,0 +1,16 @@
+export declare function red(msg: string): string;
+export declare function green(msg: string): string;
+export declare function magenta(msg: string): string;
+export declare function yellow(msg: string): string;
+export declare function blue(msg: string): string;
+export declare function cyan(msg: string): string;
+export declare function lightRed(msg: string): string;
+export declare function lightGreen(msg: string): string;
+export declare function lightBlue(msg: string): string;
+export declare function lightMagenta(msg: string): string;
+export declare function lightCyan(msg: string): string;
+export declare function lightYellow(msg: string): string;
+export declare function lightWhite(msg: string): string;
+export declare function darkGray(msg: string): string;
+export declare function lightGray(msg: string): string;
+//# sourceMappingURL=colours.d.ts.map
