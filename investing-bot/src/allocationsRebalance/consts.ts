@@ -1,7 +1,8 @@
 import { U64_MAX } from '@kamino-finance/klend-sdk';
 
-export const DEFAULT_ALLOCATIONS_POINTS_RESOLUTION = 0.1;
 export const DEFAULT_ALLOCATION_WEIGHT = 100_000;
+/** The smallest reserve weight total the pipeline keeps on a vault with no unallocated weight: one unit is 0.01%. */
+export const MIN_ALLOCATION_WEIGHT_TOTAL = 10_000;
 export const MAX_ALLOCATION_CAP_IN_LAMPORTS = U64_MAX;
 export const DEFAULT_DRIPPING_RATE_PERCENT = 20; // % of the gap between current and MAX_YIELD target weights closed per iteration; used when drippingRatePercent is not set in the allocation config
 /** Maximum allowed utilization change (absolute) per reserve per rebalance iteration */

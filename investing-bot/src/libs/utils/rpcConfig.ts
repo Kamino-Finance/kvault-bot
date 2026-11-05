@@ -1,5 +1,7 @@
 import { FeePercentileSupport, RpcEndpointConfig, RpcEndpointsConfig, RpcUrl } from 'kvaults-investing-bot-tx/model';
-import { getAllEnvsByPrefix, getEnv, getEnvOrDefaultBool, getEnvOrDefaultJson, parseValidEnum } from './env.js';
+import { readBoolean, readJson, readPrefix, readUrl } from '../../config/schema.js';
+import { SETTINGS } from '../../config/settings.js';
+import { parseValidEnum } from './env.js';
 
 /**
  * Parses the RPC endpoints' configuration from environment variables.
@@ -15,7 +17,7 @@ import { getAllEnvsByPrefix, getEnv, getEnvOrDefaultBool, getEnvOrDefaultJson, p
  * - `RPC_PRIORITY_FEE_<n>_TRITON` / `RPC_PRIORITY_FEE_<n>_HELIUS`: RPCs that support priority fee APIs.
  */
 export function parseRpcEndpointsConfigEnvs(): RpcEndpointsConfig {
-  if (getEnvOrDefaultBool('USE_RPC_CONFIG_FILE', false)) {
+  if (readBoolean(SETTINGS.USE_RPC_CONFIG_FILE)) {
     return parseIndexedRpcEndpointsConfigEnvs();
   }
   return parseLegacyRpcEndpointsConfigEnvs();
@@ -69,7 +71,8 @@ function parseIndexedRpcEndpointsConfigEnvs(): RpcEndpointsConfig {
 }
 
 function parseIndexedRpcUrlEnvs(envPrefix: 'RPC_READ' | 'RPC_SEND'): IndexedRpcUrlEnv[] {
-  return [...getAllEnvsByPrefix(`${envPrefix}_`).entries()]
+  const envs = envPrefix === 'RPC_READ' ? readPrefix(SETTINGS['RPC_READ_*']) : readPrefix(SETTINGS['RPC_SEND_*']);
+  return [...envs.entries()]
     .map(([keySuffix, url]) => parseIndexedRpcUrlEnv(envPrefix, keySuffix, url))
     .sort((left, right) => left.index - right.index);
 }
@@ -87,7 +90,7 @@ function parseIndexedRpcUrlEnv(envPrefix: 'RPC_READ' | 'RPC_SEND', keySuffix: st
 }
 
 function parsePriorityFeeRpcUrlEnvs(): PriorityFeeRpcUrlEnv[] {
-  return [...getAllEnvsByPrefix('RPC_PRIORITY_FEE_').entries()]
+  return [...readPrefix(SETTINGS['RPC_PRIORITY_FEE_*']).entries()]
     .map(([keySuffix, url]) => parsePriorityFeeRpcUrlEnv(keySuffix, url))
     .sort((left, right) => left.index - right.index || left.envName.localeCompare(right.envName));
 }
@@ -109,15 +112,15 @@ function parsePriorityFeeRpcUrlEnv(keySuffix: string, url: string): PriorityFeeR
 }
 
 function parseLegacyRpcEndpointsConfigEnvs(): RpcEndpointsConfig {
-  const legacyOptionalSingleEndpoint = [getEnv('RPC_ENDPOINT')]
+  const legacyOptionalSingleEndpoint = [readUrl(SETTINGS.RPC_ENDPOINT)]
     .filter((env) => env !== undefined)
     .map((url) =>
       new RpcEndpointConfig(new RpcUrl(url)).withFeePercentileSupport(resolveDefaultFeePercentileSupport(url))
     );
-  const jsonArrayEndpoints = getEnvOrDefaultJson<EnvRpcEndpointConfig[]>('RPC_ENDPOINTS', []).map(
+  const jsonArrayEndpoints = readJson<EnvRpcEndpointConfig[]>(SETTINGS.RPC_ENDPOINTS).map(
     (envRpcEndpointConfig: EnvRpcEndpointConfig) => parseRpcEndpointConfigJson(envRpcEndpointConfig)
   );
-  const flatEnvVarEndpoints = [...getAllEnvsByPrefix('RPC_ENDPOINT_').entries()]
+  const flatEnvVarEndpoints = [...readPrefix(SETTINGS['RPC_ENDPOINT_*']).entries()]
     .sort(([leftKey], [rightKey]) => leftKey.localeCompare(rightKey))
     .map(([key, url]) =>
       new RpcEndpointConfig(new RpcUrl(url).withCustomName(key)).withFeePercentileSupport(

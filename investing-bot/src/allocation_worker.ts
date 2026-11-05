@@ -1,8 +1,9 @@
 import { parentPort, workerData } from 'worker_threads';
 import { logger } from 'kvaults-investing-bot-logger';
-import { Cluster } from 'kvaults-investing-bot-tx/model';
+import { parseCluster } from 'kvaults-investing-bot-tx/model';
 import { runAllocationLoop } from './allocation_loop.js';
 import { recursiveTryCatch } from './libs/utils/recursiveTryCatch.js';
+import { LoopHeartbeat } from './utils/loop.js';
 import { markProcessShuttingDown } from './utils/shutdown.js';
 
 // Memory monitoring and garbage collection utilities
@@ -50,7 +51,7 @@ function checkMemoryUsage() {
 async function startAllocationWorker() {
   let cleanup = () => {};
   try {
-    const cluster = workerData.cluster as Cluster;
+    const cluster = parseCluster(String(workerData.cluster));
 
     logger.info('[allocation-worker] Starting allocation loop in worker thread');
 
@@ -77,15 +78,14 @@ async function startAllocationWorker() {
       clearInterval(gcInterval);
     };
 
-    // Handle cleanup on exit
+    // Handle cleanup on exit. Node does not deliver signals to a worker thread; the main thread sends 'shutdown'.
     process.on('exit', cleanup);
-    process.on('SIGINT', cleanup);
-    process.on('SIGTERM', cleanup);
 
-    const heartbeat = () => parentPort?.postMessage({ type: 'heartbeat' });
+    const heartbeat: LoopHeartbeat = (event) => parentPort?.postMessage({ type: event ?? 'heartbeat' });
 
     // Run allocation loop with recursive try-catch
-    await recursiveTryCatch(() => runAllocationLoop(cluster, heartbeat), '[allocation-worker]');
+    const onNoNewFundsReserves = (reserves: string[]) => parentPort?.postMessage({ type: 'no-new-funds', reserves });
+    await recursiveTryCatch(() => runAllocationLoop(cluster, heartbeat, onNoNewFundsReserves), '[allocation-worker]');
     cleanup();
     parentPort?.close();
   } catch (error) {

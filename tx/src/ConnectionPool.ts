@@ -6,13 +6,13 @@ import {
   SolanaRpcApi,
   SolanaRpcSubscriptionsApi,
 } from '@solana/kit';
-import { Connection as LegacyConnection } from '@solana/web3.js';
 import {
   Cluster,
   createDefaultRpc,
   createResilientRpc,
+  DEFAULT_RPC_REQUEST_TIMEOUT_MS,
+  resolveWebSocketEndpoint,
   resolveRpcCallerChain,
-  RpcEndpointConfig,
   RpcEndpointsConfig,
   RpcUrl,
 } from './model/index.js';
@@ -40,30 +40,21 @@ export type LiquidatorRpcApi = SolanaRpcApi &
   GetPriorityFeeEstimateApi;
 
 export class ConnectionPool {
-  private readonly cluster: Cluster;
   private readonly rpc: Rpc<LiquidatorRpcApi>;
   private readonly priorityFeeProvider: PriorityFeeProvider;
   private readonly wsRpc: RpcSubscriptions<SolanaRpcSubscriptionsApi>;
-  private readonly mccs: Array<MulticastTransportConfig>;
   private readonly config: ConnectionPoolConfig;
-  private readonly legacyReadConnection: LegacyConnection;
 
   constructor(
-    cluster: Cluster,
     rpc: Rpc<LiquidatorRpcApi>,
     priorityFeeProvider: PriorityFeeProvider,
     wsRpc: RpcSubscriptions<SolanaRpcSubscriptionsApi>,
-    config: ConnectionPoolConfig,
-    mccs: Array<MulticastTransportConfig>,
-    legacyReadConnection: LegacyConnection
+    config: ConnectionPoolConfig
   ) {
-    this.cluster = cluster;
     this.rpc = rpc;
     this.priorityFeeProvider = priorityFeeProvider;
     this.wsRpc = wsRpc;
     this.config = config;
-    this.mccs = mccs;
-    this.legacyReadConnection = legacyReadConnection;
   }
 
   public static new(
@@ -74,25 +65,28 @@ export class ConnectionPool {
     config: ConnectionPoolConfig
   ): ConnectionPool {
     if (cluster === 'localnet') {
-      const localnetRpc = createDefaultRpc<LiquidatorRpcApi>(new RpcUrl('http://localhost:8899'));
+      const localnetRpc = createDefaultRpc<LiquidatorRpcApi>(
+        new RpcUrl('http://localhost:8899'),
+        config.rpcRequestTimeoutMs
+      );
       const localnetWs = createSolanaRpcSubscriptions('ws://localhost:8900');
-
-      const legacyReadConnection = new LegacyConnection('http://localhost:8899', {
-        commitment: READ_CONNECTION_FINALITY,
-      });
-
-      return new ConnectionPool(cluster, localnetRpc, NO_PRIORITY_FEE, localnetWs, config, mccs, legacyReadConnection);
+      return new ConnectionPool(localnetRpc, NO_PRIORITY_FEE, localnetWs, config);
     }
 
     const multicastRpcUrls = mccs.map(({ name, connection }) => new RpcUrl(connection).withCustomName(name));
 
     const rpc = createResilientRpc<LiquidatorRpcApi>(
-      resolveRpcCallerChain(rpcEndpointsConfig.allRpcs(), multicastRpcUrls)
+      resolveRpcCallerChain(rpcEndpointsConfig.allRpcs(), multicastRpcUrls, config.rpcRequestTimeoutMs)
     );
 
     const priorityFeeConfig = config.priorityFeeConfig;
     const priorityFeeProvider = createResilientPriorityFeeProvider(
-      resolvePriorityFeeProviderChain(rpcEndpointsConfig.allRpcs(), priorityFeeConfig.priorityFeePercentile),
+      resolvePriorityFeeProviderChain(
+        rpcEndpointsConfig.allRpcs(),
+        priorityFeeConfig.priorityFeePercentile,
+        config.externalRequestTimeoutMs,
+        config.rpcRequestTimeoutMs
+      ),
       {
         defaultPerCu: SOL.microLamports(priorityFeeConfig.microLamportsPerCuDefault),
         maxPerCu: SOL.microLamports(priorityFeeConfig.microLamportsPerCuMax),
@@ -100,55 +94,11 @@ export class ConnectionPool {
       }
     );
 
-    // TODO(rpc-fallbacks): the WS here could use some similar fallback/redundancy mechanic:
-    const wsRpc = createSolanaRpcSubscriptions(wsConnectionEndpoint ?? rpcEndpointsConfig.readUrl());
+    // A blank WS_ENDPOINT (the profile template leaves it empty) counts as unset.
+    const wsEndpoint = resolveWebSocketEndpoint(wsConnectionEndpoint, rpcEndpointsConfig.readUrl());
+    const wsRpc = createSolanaRpcSubscriptions(wsEndpoint);
 
-    const legacyReadConnection = new LegacyConnection(rpcEndpointsConfig.readUrl(), {
-      commitment: READ_CONNECTION_FINALITY,
-      wsEndpoint: wsConnectionEndpoint,
-    });
-
-    return new ConnectionPool(cluster, rpc, priorityFeeProvider, wsRpc, config, mccs, legacyReadConnection);
-  }
-
-  public static singleConnection(
-    cluster: Cluster,
-    readConnectionEndpoint: string,
-    wsConnectionEndpoint?: string
-  ): ConnectionPool {
-    return ConnectionPool.new(
-      cluster,
-      new RpcEndpointsConfig(new RpcEndpointConfig(new RpcUrl(readConnectionEndpoint))),
-      wsConnectionEndpoint,
-      [],
-      {
-        spam: false,
-        simulate: true,
-        multicastJito: false,
-        priorityFeeConfig: {
-          priorityFeePercentile: undefined,
-          microLamportsPerCuDefault: 0,
-          microLamportsPerCuMin: 0,
-          microLamportsPerCuMax: 0,
-        },
-      }
-    );
-  }
-
-  public cloneWithConfig(c: ConnectionPoolConfig): ConnectionPool {
-    return new ConnectionPool(
-      this.cluster,
-      this.rpc,
-      this.priorityFeeProvider,
-      this.wsRpc,
-      c,
-      this.mccs,
-      this.legacyReadConnection
-    );
-  }
-
-  public getCluster(): Cluster {
-    return this.cluster;
+    return new ConnectionPool(rpc, priorityFeeProvider, wsRpc, config);
   }
 
   public getRpc(): Rpc<LiquidatorRpcApi> {
@@ -171,12 +121,13 @@ export class ConnectionPool {
     return this.getConfig().simulate;
   }
 
-  public shouldMulticastJito(): boolean {
-    return this.getConfig().multicastJito;
+  /** Deadline for one RPC call, and for waiting on a transaction's confirmation. */
+  public getRpcRequestTimeoutMs(): number {
+    return this.getConfig().rpcRequestTimeoutMs ?? DEFAULT_RPC_REQUEST_TIMEOUT_MS;
   }
 
-  public getLegacyReadConnection(): LegacyConnection {
-    return this.legacyReadConnection;
+  public shouldMulticastJito(): boolean {
+    return this.getConfig().multicastJito;
   }
 
   public getPriorityFeeProvider(): PriorityFeeProvider {
@@ -189,6 +140,10 @@ export type ConnectionPoolConfig = {
   simulate: boolean;
   multicastJito: boolean;
   priorityFeeConfig: PriorityFeeConfig;
+  /** Deadline for one RPC call; defaults to two minutes. */
+  rpcRequestTimeoutMs?: number;
+  /** Deadline for one external HTTP call such as a fee estimate; defaults to thirty seconds. */
+  externalRequestTimeoutMs?: number;
 };
 
 export type PriorityFeeConfig = {
@@ -207,13 +162,12 @@ export type PriorityFeeConfig = {
 };
 
 export function hideSensitiveRpcCredentials(url: string): string {
-  if (url.startsWith('http://localhost') || url.startsWith('http://127.0.0.1')) {
-    return url;
+  let parsed: URL;
+  try {
+    parsed = new URL(url);
+  } catch {
+    return '****';
   }
-  // Remove query params
-  let queryParamsRemoved = url.replace(/\?.*/, '');
-  // Remove paths
-  queryParamsRemoved = queryParamsRemoved.replace(/(\/\/[^/]+\/)[^/]+/, '$1****');
-  queryParamsRemoved = queryParamsRemoved.replace(/(apiKey=)[^&]+/, '$1xxxx');
-  return queryParamsRemoved;
+  // Credentials travel as user-info, as any path segment, or as a query parameter: keep only scheme and host.
+  return `${parsed.protocol}//${parsed.host}${parsed.pathname === '/' ? '' : '/****'}`;
 }

@@ -2,10 +2,39 @@ import { randomUUID } from 'crypto';
 import { createLogger, format, transports } from 'winston';
 import { getEnvOrDefault } from './utils.js';
 
+/** LOG_LEVEL default. The bot's settings registry declares the same value; a parity test keeps them equal. */
+export const DEFAULT_LOG_LEVEL = 'info';
+
 const sessionId = randomUUID().slice(0, 5);
+
+/** An HTTP client error, such as an axios error, carries its request: the config holds the request headers. */
+function carriesHttpRequest(value: unknown): value is Record<string, unknown> {
+  const config = (value as { config?: unknown } | null)?.config;
+  return typeof config === 'object' && config !== null && 'headers' in config;
+}
+
+/**
+ * Drops the request config, the request and the response from a logged HTTP client error and from its cause. The
+ * headers can hold an API key, and the JSON format writes every own property of the error.
+ */
+export const dropHttpRequestDetails = format((info) => {
+  if (carriesHttpRequest(info)) {
+    delete info.config;
+    delete info.request;
+    delete info.response;
+  }
+  if (carriesHttpRequest(info.cause)) {
+    // eslint-disable-next-line @typescript-eslint/no-unused-vars
+    const { config, request, response, ...cause } = info.cause;
+    info.cause = cause;
+  }
+  return info;
+});
+
 export const logger = createLogger({
-  level: getEnvOrDefault('LOG_LEVEL', 'info'),
-  format: format.combine(format.errors({ stack: true }), format.splat(), format.json()),
+  level: getEnvOrDefault('LOG_LEVEL', DEFAULT_LOG_LEVEL),
+  // The request details are dropped after splat: splat merges the logged error's own properties into the entry again.
+  format: format.combine(format.errors({ stack: true }), format.splat(), dropHttpRequestDetails(), format.json()),
   //  service: 'klend-liquidations-bot', session: sessionId },
   defaultMeta: {},
   transports: [

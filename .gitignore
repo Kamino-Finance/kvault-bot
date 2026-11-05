@@ -1,0 +1,22 @@
+# Dependencies and build output
+node_modules/
+dist/
+*.tsbuildinfo
+
+# Operator secrets — never commit these to a public repo
+.env
+.env.*
+!.env.example
+investor*.json
+allocation_admin*.json
+*.keypair.json
+keys/
+
+# Deployment-specific runtime state; the *_example.json templates are committed instead
+allocation_config.json
+danger_blacklist.json
+# Narrower than *.lock on purpose: yarn.lock must stay committed.
+*.json.lock
+
+# OS
+.DS_Store

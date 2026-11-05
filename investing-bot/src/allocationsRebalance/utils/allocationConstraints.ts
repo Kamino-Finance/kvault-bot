@@ -1,7 +1,6 @@
 import { Decimal } from 'decimal.js';
 
 import { Address } from '@solana/kit';
-import { logger } from 'kvaults-investing-bot-logger';
 
 /**
  * Represents reserve constraints for allocation calculations; everything is in tokens
@@ -40,12 +39,30 @@ export interface BoundedWeightRedistributionResult {
   isFeasible: boolean;
 }
 
+/** Tokens a reserve takes before its deposit limit: null without a limit, negative when the reserve is over it. */
+function getDepositableTokens(depositLimitTokens: Decimal | null, currentTotalSupplyInReserveTokens: Decimal) {
+  return depositLimitTokens === null ? null : depositLimitTokens.sub(currentTotalSupplyInReserveTokens);
+}
+
+/** Tokens the vault can withdraw from a reserve now: its free liquidity, bounded by the withdrawal cap when enabled. */
+function getWithdrawableTokens(
+  availableLiquidityInReserveTokens: Decimal,
+  reserveWithdrawalCapCapacityTokens: Decimal | null,
+  reserveWithdrawalCapCurrentTokens: Decimal | null
+): Decimal {
+  return reserveWithdrawalCapCapacityTokens === null || reserveWithdrawalCapCurrentTokens === null
+    ? availableLiquidityInReserveTokens
+    : Decimal.min(
+        availableLiquidityInReserveTokens,
+        Decimal.max(reserveWithdrawalCapCapacityTokens.sub(reserveWithdrawalCapCurrentTokens), 0)
+      );
+}
+
 /**
  * Calculate the maximum weight a reserve can have based on deposit constraints
  */
 export function calculateMaxDepositWeight(
   targetWeight: Decimal,
-  currentWeight: Decimal,
   investedTokensInReserve: Decimal,
   depositLimitTokens: Decimal | null,
   currentTotalSupplyInReserveTokens: Decimal,
@@ -69,7 +86,7 @@ export function calculateMaxDepositWeight(
 
   const newAmountInReserveTokens = aumTokens.mul(targetWeight).div(totalTargetWeight);
   const liquidityDeltaTokens = newAmountInReserveTokens.sub(investedTokensInReserve);
-  const maxDepositableTokens = depositLimitTokens.sub(currentTotalSupplyInReserveTokens);
+  const maxDepositableTokens = getDepositableTokens(depositLimitTokens, currentTotalSupplyInReserveTokens)!;
   if (maxDepositableTokens.lte(0)) {
     if (liquidityDeltaTokens.gt(0)) {
       // At a full reserve, the safe ceiling is the weight implied by what the
@@ -90,7 +107,8 @@ export function calculateMaxDepositWeight(
 
   if (liquidityDeltaTokens.gt(0) && liquidityDeltaTokens.gt(maxDepositableTokens)) {
     // Constraint hit: can't deposit as much as desired
-    const maxDepositableAmountTokens = maxDepositableTokens.mul(0.98).floor(); // 2% safety margin
+    // 2% safety margin, kept in fractional tokens: whole-token rounding erases the headroom of a high-value token.
+    const maxDepositableAmountTokens = maxDepositableTokens.mul(0.98);
     const maxAmountInReserveTokens = investedTokensInReserve.add(maxDepositableAmountTokens);
     const maxWeight = maxAmountInReserveTokens.mul(totalTargetWeight).div(aumTokens);
 
@@ -116,7 +134,6 @@ export function calculateMaxDepositWeight(
  */
 export function calculateMinWithdrawalWeight(
   targetWeight: Decimal,
-  currentWeight: Decimal,
   investedTokensInReserve: Decimal,
   availableLiquidityInReserveTokens: Decimal,
   reserveWithdrawalCapCapacityTokens: Decimal | null,
@@ -132,21 +149,19 @@ export function calculateMinWithdrawalWeight(
     };
   }
 
-  // If withdrawal cap is disabled (null values), only use available liquidity
-  const totalWithdrawableAmountInTokens =
-    reserveWithdrawalCapCapacityTokens === null || reserveWithdrawalCapCurrentTokens === null
-      ? availableLiquidityInReserveTokens
-      : Decimal.min(
-          availableLiquidityInReserveTokens,
-          Decimal.max(reserveWithdrawalCapCapacityTokens.sub(reserveWithdrawalCapCurrentTokens), 0)
-        );
+  const totalWithdrawableAmountInTokens = getWithdrawableTokens(
+    availableLiquidityInReserveTokens,
+    reserveWithdrawalCapCapacityTokens,
+    reserveWithdrawalCapCurrentTokens
+  );
 
   const newAmountInReserveTokens = aumTokens.mul(targetWeight).div(totalTargetWeight);
   const liquidityDeltaTokens = newAmountInReserveTokens.sub(investedTokensInReserve);
 
   if (liquidityDeltaTokens.lt(0) && liquidityDeltaTokens.abs().gt(totalWithdrawableAmountInTokens)) {
     // Constraint hit: can't withdraw as much as desired
-    const maxWithdrawableAmount = totalWithdrawableAmountInTokens.mul(0.98).floor(); // 2% safety margin
+    // 2% safety margin, kept in fractional tokens: whole-token rounding erases the headroom of a high-value token.
+    const maxWithdrawableAmount = totalWithdrawableAmountInTokens.mul(0.98);
     const minAmountInReserve = investedTokensInReserve.sub(maxWithdrawableAmount);
     const minWeight = minAmountInReserve.mul(totalTargetWeight).div(aumTokens);
 
@@ -177,7 +192,6 @@ export function applyReserveConstraints(
 ): ConstraintResult {
   const {
     targetWeight,
-    currentWeight,
     investedTokensInReserve,
     depositLimitTokens,
     currentTotalSupplyInReserveTokens,
@@ -189,7 +203,6 @@ export function applyReserveConstraints(
   // Check deposit constraints first
   const depositResult = calculateMaxDepositWeight(
     targetWeight,
-    currentWeight,
     investedTokensInReserve,
     depositLimitTokens,
     currentTotalSupplyInReserveTokens,
@@ -204,7 +217,6 @@ export function applyReserveConstraints(
   // Check withdrawal constraints
   const withdrawalResult = calculateMinWithdrawalWeight(
     targetWeight,
-    currentWeight,
     investedTokensInReserve,
     availableLiquidityInReserveTokens,
     reserveWithdrawalCapCapacityTokens,
@@ -225,30 +237,27 @@ export function getTargetTokenConstraintType(
   targetTokens: Decimal
 ): 'deposit' | 'withdrawal' | 'none' {
   const tokenDelta = targetTokens.sub(constraints.investedTokensInReserve);
-  if (tokenDelta.gt(0) && constraints.depositLimitTokens !== null) {
-    const maxDepositable = Decimal.max(
-      constraints.depositLimitTokens.sub(constraints.currentTotalSupplyInReserveTokens),
-      0
-    );
-    if (tokenDelta.gt(maxDepositable)) {
-      return 'deposit';
-    }
+  const depositable = getDepositableTokens(
+    constraints.depositLimitTokens,
+    constraints.currentTotalSupplyInReserveTokens
+  );
+  if (tokenDelta.gt(0) && depositable !== null && tokenDelta.gt(Decimal.max(depositable, 0))) {
+    return 'deposit';
   }
 
-  if (tokenDelta.lt(0)) {
-    const maxWithdrawable =
-      constraints.reserveWithdrawalCapCapacityTokens === null || constraints.reserveWithdrawalCapCurrentTokens === null
-        ? constraints.availableLiquidityInReserveTokens
-        : Decimal.min(
-            constraints.availableLiquidityInReserveTokens,
-            Decimal.max(
-              constraints.reserveWithdrawalCapCapacityTokens.sub(constraints.reserveWithdrawalCapCurrentTokens),
-              0
-            )
-          );
-    if (tokenDelta.abs().gt(maxWithdrawable)) {
-      return 'withdrawal';
-    }
+  if (
+    tokenDelta.lt(0) &&
+    tokenDelta
+      .abs()
+      .gt(
+        getWithdrawableTokens(
+          constraints.availableLiquidityInReserveTokens,
+          constraints.reserveWithdrawalCapCapacityTokens,
+          constraints.reserveWithdrawalCapCurrentTokens
+        )
+      )
+  ) {
+    return 'withdrawal';
   }
 
   return 'none';
@@ -270,7 +279,6 @@ export function calculateReserveAllocationWeightBounds(
 
   const maxDepositResult = calculateMaxDepositWeight(
     totalTargetWeight,
-    constraints.currentWeight,
     constraints.investedTokensInReserve,
     constraints.depositLimitTokens,
     constraints.currentTotalSupplyInReserveTokens,
@@ -279,7 +287,6 @@ export function calculateReserveAllocationWeightBounds(
   );
   const minWithdrawalResult = calculateMinWithdrawalWeight(
     new Decimal(0),
-    constraints.currentWeight,
     constraints.investedTokensInReserve,
     constraints.availableLiquidityInReserveTokens,
     constraints.reserveWithdrawalCapCapacityTokens,
@@ -351,30 +358,6 @@ export function redistributeWeightDifferenceWithinBounds(
 
   const isFeasible = applyIntegerWeightDifference(normalizedAllocation, targetTotalWeight, effectiveBounds);
   return { allocation: normalizedAllocation, isFeasible };
-}
-
-/**
- * Scale weights proportionally to an exact integer total. Entries in
- * `constrainedReserves` are locked at their current weight.
- */
-export function redistributeWeightDifference(
-  adjustedAllocation: Map<Address, Decimal>,
-  targetTotalWeight: Decimal,
-  constrainedReserves: Set<Address> = new Set()
-): Map<Address, Decimal> {
-  const weightBounds = new Map<Address, AllocationWeightBounds>();
-  for (const reserve of constrainedReserves) {
-    const weight = adjustedAllocation.get(reserve);
-    if (weight) {
-      weightBounds.set(reserve, { minWeight: weight, maxWeight: weight });
-    }
-  }
-
-  const result = redistributeWeightDifferenceWithinBounds(adjustedAllocation, targetTotalWeight, weightBounds);
-  if (!result.isFeasible) {
-    logger.warn(`Cannot redistribute weights to the exact target without violating constraints.`);
-  }
-  return result.allocation;
 }
 
 function applyIntegerWeightDifference(
@@ -507,6 +490,6 @@ export function normalizeWeightsToTotal(
 /**
  * Calculate the total weight of all reserves in the allocation
  */
-export function calculateTotalWeight(allocation: Map<Address, Decimal>): Decimal {
+export function calculateTotalWeight(allocation: ReadonlyMap<Address, Decimal>): Decimal {
   return Array.from(allocation.values()).reduce((sum, weight) => sum.add(weight), new Decimal(0));
 }

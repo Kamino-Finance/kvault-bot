@@ -1,9 +1,10 @@
-import { Address } from '@solana/kit';
+import { Address, isAddress } from '@solana/kit';
 import { logger } from 'kvaults-investing-bot-logger';
-import { getEnvOrDefault } from '../libs/utils/env.js';
+import { readUrl } from '../config/schema.js';
+import { SETTINGS } from '../config/settings.js';
 import { EXTERNAL_REQUEST_TIMEOUT_MS } from './timeout.js';
 
-export const KAMINO_TOKEN_FLAGS_URL = 'https://tokens.kamino.finance/tokens-flags.json';
+export const KAMINO_TOKEN_FLAGS_URL = SETTINGS.KAMINO_TOKEN_FLAGS_URL.default;
 
 const STABLECOIN_TAG = 'stablecoin';
 const LST_TAG = 'lst';
@@ -42,25 +43,27 @@ export interface TokenFlags {
  * throw rather than returning an empty map, because an empty map is indistinguishable from "nothing
  * is a stablecoin" and would silently disable every peg check.
  */
-export async function fetchTokenFlags(): Promise<Map<Address, TokenFlags>> {
-  const url = getEnvOrDefault('KAMINO_TOKEN_FLAGS_URL', KAMINO_TOKEN_FLAGS_URL);
+export async function fetchTokenFlags(
+  timeoutMs: number = EXTERNAL_REQUEST_TIMEOUT_MS
+): Promise<Map<Address, TokenFlags>> {
+  const url = readUrl(SETTINGS.KAMINO_TOKEN_FLAGS_URL);
   const abortController = new AbortController();
-  const timeout = setTimeout(() => abortController.abort(), EXTERNAL_REQUEST_TIMEOUT_MS);
-  let response: Response;
+  const timeout = setTimeout(() => abortController.abort(), timeoutMs);
+  let body: unknown;
   try {
-    response = await fetch(url, {
+    const response = await fetch(url, {
       method: 'GET',
       headers: { 'Content-Type': 'application/json' },
       signal: abortController.signal,
     });
+    if (!response.ok) {
+      throw new Error(`Failed to fetch token flags: ${response.status} ${response.statusText}`);
+    }
+    // The deadline covers the body too: a feed that sends its headers and then stalls must still abort.
+    body = await response.json();
   } finally {
     clearTimeout(timeout);
   }
-  if (!response.ok) {
-    throw new Error(`Failed to fetch token flags: ${response.status} ${response.statusText}`);
-  }
-
-  const body = (await response.json()) as unknown;
   if (!Array.isArray(body)) {
     throw new Error('Token flags API returned a malformed response: expected an array');
   }
@@ -68,11 +71,13 @@ export async function fetchTokenFlags(): Promise<Map<Address, TokenFlags>> {
   const flags = new Map<Address, TokenFlags>();
   let skipped = 0;
   for (const entry of body as TokenFlagsResponseEntry[]) {
-    if (!entry || typeof entry.mint !== 'string' || entry.mint.length === 0 || !Array.isArray(entry.tags)) {
+    // A mint that is not a valid address can never match a reserve; keeping it would let an all-invalid
+    // feed pass the usable-entries check below and silently disable every peg check.
+    if (!entry || typeof entry.mint !== 'string' || !isAddress(entry.mint) || !Array.isArray(entry.tags)) {
       skipped++;
       continue;
     }
-    flags.set(entry.mint as Address, {
+    flags.set(entry.mint, {
       symbol: typeof entry.symbol === 'string' ? entry.symbol : '',
       isStablecoin: entry.tags.includes(STABLECOIN_TAG),
       isLst: entry.tags.includes(LST_TAG),

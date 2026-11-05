@@ -1,7 +1,14 @@
 import { Command } from 'commander';
-import { RebalanceStrategy } from './allocationsRebalance/rebalanceTypes.js';
-import { initBlacklistFile, readBlacklistFile, updateBlacklistFile } from './danger/blacklistStore.js';
+import { listStrategies } from './allocationsRebalance/strategyRegistry.js';
+import './allocationsRebalance/strategies/index.js';
+import {
+  formatBlacklistFile,
+  initBlacklistFile,
+  readBlacklistFile,
+  updateBlacklistFile,
+} from './danger/blacklistStore.js';
 import { DEFAULT_BLACKLIST_PATH } from './libs/utils/consts.js';
+import { SETTINGS } from './config/settings.js';
 
 /**
  * Default blacklist path for CLI commands: the same DANGER_BLACKLIST_PATH the runtime uses, so an
@@ -9,13 +16,10 @@ import { DEFAULT_BLACKLIST_PATH } from './libs/utils/consts.js';
  * volume in production) rather than a stale compile-time default in the container's working dir.
  * When the env var is PRESENT it is propagated verbatim (even if blank) so `requireBlacklistPath`
  * can reject a blank value the same way the runtime (`envConfig`) does, instead of silently falling
- * back to a different file. Only when the var is unset do we use the compile-time default.
+ * back to a different file. Only when the var is unset do we use the registry default.
  */
 function defaultBlacklistPath(): string {
-  if ('DANGER_BLACKLIST_PATH' in process.env) {
-    return process.env.DANGER_BLACKLIST_PATH ?? '';
-  }
-  return DEFAULT_BLACKLIST_PATH;
+  return process.env[SETTINGS.DANGER_BLACKLIST_PATH.name] ?? DEFAULT_BLACKLIST_PATH;
 }
 
 /**
@@ -38,8 +42,8 @@ async function main() {
   commands.name('vaults-bot-cli').description('CLI to interact with the vaults bot and config');
 
   commands.command('print-rebalance-strategies').action(async () => {
-    // print all possible values of RebalanceStrategy
-    const rebalanceStrategies = Object.values(RebalanceStrategy);
+    // print every registered strategy name
+    const rebalanceStrategies = listStrategies().map((definition) => definition.name);
     console.log(rebalanceStrategies);
   });
 
@@ -59,22 +63,10 @@ async function main() {
 
   danger
     .command('list')
-    .description('List all blacklisted reserves')
+    .description('List the blacklisted reserves, the pending evacuations and the deposit freezes')
     .option('--path <path>', 'Path to blacklist file', defaultBlacklistPath())
     .action((opts) => {
-      const blacklist = readBlacklistFile(requireBlacklistPath(opts.path));
-      if (blacklist.blacklistedReserves.length === 0) {
-        console.log('No blacklisted reserves.');
-        return;
-      }
-      console.log(`Blacklisted reserves (${blacklist.blacklistedReserves.length}):\n`);
-      for (const entry of blacklist.blacklistedReserves) {
-        console.log(`  Reserve:  ${entry.reserve}`);
-        console.log(`  Trigger:  ${entry.triggerName}`);
-        console.log(`  Reason:   ${entry.reason}`);
-        console.log(`  Time:     ${entry.timestamp}`);
-        console.log('');
-      }
+      console.log(formatBlacklistFile(readBlacklistFile(requireBlacklistPath(opts.path))));
     });
 
   danger

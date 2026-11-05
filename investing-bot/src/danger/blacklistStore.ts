@@ -25,6 +25,51 @@ function isNonEmptyString(value: unknown): value is string {
   return typeof value === 'string' && value.trim().length > 0;
 }
 
+/** Checks the fields of one entry, `addressFields` first; `prefix` names the entry in the error. */
+function validateEntry(entry: unknown, prefix: string, addressFields: readonly string[]): void {
+  const corrupt = (problem: string) => new Error(`${prefix}${problem} Refusing to continue with corrupt safety state.`);
+  if (!isNonNullObject(entry)) {
+    throw corrupt(' must be an object.');
+  }
+  for (const field of addressFields) {
+    const value = entry[field];
+    if (!isNonEmptyString(value) || !isAddress(value)) {
+      throw corrupt(`.${field} must be a non-empty Solana address string.`);
+    }
+  }
+  for (const field of ['triggerName', 'reason']) {
+    if (!isNonEmptyString(entry[field])) {
+      throw corrupt(`.${field} must be a non-empty string.`);
+    }
+  }
+  if (!isNonEmptyString(entry.timestamp) || Number.isNaN(Date.parse(entry.timestamp))) {
+    throw corrupt('.timestamp must be a valid timestamp string.');
+  }
+}
+
+/** Checks the fields of one deposit freeze; `prefix` names the entry in the error. */
+function validateDepositFreeze(entry: unknown, prefix: string): void {
+  const corrupt = (problem: string) => new Error(`${prefix}${problem} Refusing to continue with corrupt safety state.`);
+  if (!isNonNullObject(entry)) {
+    throw corrupt(' must be an object.');
+  }
+  for (const field of ['vault', 'reserve']) {
+    const value = entry[field];
+    if (!isNonEmptyString(value) || !isAddress(value)) {
+      throw corrupt(`.${field} must be a non-empty Solana address string.`);
+    }
+  }
+  for (const field of ['originalCapLamports', 'frozenCapLamports']) {
+    const value = entry[field];
+    if (typeof value !== 'string' || !/^\d+$/.test(value)) {
+      throw corrupt(`.${field} must be a non-negative integer string.`);
+    }
+  }
+  if (!isNonEmptyString(entry.timestamp) || Number.isNaN(Date.parse(entry.timestamp))) {
+    throw corrupt('.timestamp must be a valid timestamp string.');
+  }
+}
+
 function validateBlacklistFile(parsed: unknown, path: string): BlacklistFile {
   if (!isNonNullObject(parsed) || !Array.isArray(parsed.blacklistedReserves)) {
     throw new Error(
@@ -34,31 +79,11 @@ function validateBlacklistFile(parsed: unknown, path: string): BlacklistFile {
   }
 
   const blacklistedReserves = parsed.blacklistedReserves;
-  blacklistedReserves.forEach((entry, index) => {
-    const prefix = `[danger-detection] Invalid blacklist file at ${path}: blacklistedReserves[${index}]`;
-    if (!isNonNullObject(entry)) {
-      throw new Error(`${prefix} must be an object. Refusing to continue with corrupt safety state.`);
-    }
-    if (!isNonEmptyString(entry.reserve) || !isAddress(entry.reserve)) {
-      throw new Error(
-        `${prefix}.reserve must be a non-empty Solana address string. ` +
-          `Refusing to continue with corrupt safety state.`
-      );
-    }
-    if (!isNonEmptyString(entry.triggerName)) {
-      throw new Error(
-        `${prefix}.triggerName must be a non-empty string. Refusing to continue with corrupt safety state.`
-      );
-    }
-    if (!isNonEmptyString(entry.reason)) {
-      throw new Error(`${prefix}.reason must be a non-empty string. Refusing to continue with corrupt safety state.`);
-    }
-    if (!isNonEmptyString(entry.timestamp) || Number.isNaN(Date.parse(entry.timestamp))) {
-      throw new Error(
-        `${prefix}.timestamp must be a valid timestamp string. Refusing to continue with corrupt safety state.`
-      );
-    }
-  });
+  blacklistedReserves.forEach((entry, index) =>
+    validateEntry(entry, `[danger-detection] Invalid blacklist file at ${path}: blacklistedReserves[${index}]`, [
+      'reserve',
+    ])
+  );
 
   const pendingEvacuations = parsed.pendingEvacuations ?? [];
   if (!Array.isArray(pendingEvacuations)) {
@@ -67,41 +92,28 @@ function validateBlacklistFile(parsed: unknown, path: string): BlacklistFile {
         `Refusing to continue with corrupt safety state.`
     );
   }
-  pendingEvacuations.forEach((entry, index) => {
-    const prefix = `[danger-detection] Invalid blacklist file at ${path}: pendingEvacuations[${index}]`;
-    if (!isNonNullObject(entry)) {
-      throw new Error(`${prefix} must be an object. Refusing to continue with corrupt safety state.`);
-    }
-    if (!isNonEmptyString(entry.vault) || !isAddress(entry.vault)) {
-      throw new Error(
-        `${prefix}.vault must be a non-empty Solana address string. ` +
-          `Refusing to continue with corrupt safety state.`
-      );
-    }
-    if (!isNonEmptyString(entry.reserve) || !isAddress(entry.reserve)) {
-      throw new Error(
-        `${prefix}.reserve must be a non-empty Solana address string. ` +
-          `Refusing to continue with corrupt safety state.`
-      );
-    }
-    if (!isNonEmptyString(entry.triggerName)) {
-      throw new Error(
-        `${prefix}.triggerName must be a non-empty string. Refusing to continue with corrupt safety state.`
-      );
-    }
-    if (!isNonEmptyString(entry.reason)) {
-      throw new Error(`${prefix}.reason must be a non-empty string. Refusing to continue with corrupt safety state.`);
-    }
-    if (!isNonEmptyString(entry.timestamp) || Number.isNaN(Date.parse(entry.timestamp))) {
-      throw new Error(
-        `${prefix}.timestamp must be a valid timestamp string. Refusing to continue with corrupt safety state.`
-      );
-    }
-  });
+  pendingEvacuations.forEach((entry, index) =>
+    validateEntry(entry, `[danger-detection] Invalid blacklist file at ${path}: pendingEvacuations[${index}]`, [
+      'vault',
+      'reserve',
+    ])
+  );
+
+  const depositFreezes = parsed.depositFreezes ?? [];
+  if (!Array.isArray(depositFreezes)) {
+    throw new Error(
+      `[danger-detection] Invalid blacklist file at ${path}: "depositFreezes" must be an array. ` +
+        `Refusing to continue with corrupt safety state.`
+    );
+  }
+  depositFreezes.forEach((entry, index) =>
+    validateDepositFreeze(entry, `[danger-detection] Invalid blacklist file at ${path}: depositFreezes[${index}]`)
+  );
 
   return {
     blacklistedReserves: blacklistedReserves as BlacklistFile['blacklistedReserves'],
     pendingEvacuations: pendingEvacuations as BlacklistFile['pendingEvacuations'],
+    depositFreezes: depositFreezes as BlacklistFile['depositFreezes'],
   };
 }
 
@@ -123,7 +135,7 @@ export function readBlacklistFile(path: string): BlacklistFile {
             `Create the directory or mount the persistent volume before starting.`
         );
       }
-      return { blacklistedReserves: [], pendingEvacuations: [] };
+      return { blacklistedReserves: [], pendingEvacuations: [], depositFreezes: [] };
     }
     throw new Error(
       `[danger-detection] Could not read blacklist file at ${path}: ${error}. ` +
@@ -133,7 +145,7 @@ export function readBlacklistFile(path: string): BlacklistFile {
 
   // An empty (or whitespace-only) file is a valid empty blacklist
   if (raw.trim() === '') {
-    return { blacklistedReserves: [], pendingEvacuations: [] };
+    return { blacklistedReserves: [], pendingEvacuations: [], depositFreezes: [] };
   }
 
   let parsed: unknown;
@@ -178,13 +190,20 @@ export function writeBlacklistFile(path: string, blacklist: BlacklistFile): void
  * behind by a crashed process is recoverable after a short stale window.
  */
 export function updateBlacklistFile<T>(path: string, update: (blacklist: BlacklistFile) => T): T {
-  const lockPath = `${path}.lock`;
-  const lockFd = acquireBlacklistLock(lockPath);
-  try {
+  return withBlacklistLock(path, () => {
     const blacklist = readBlacklistFile(path);
     const result = update(blacklist);
     writeBlacklistFile(path, blacklist);
     return result;
+  });
+}
+
+/** Runs `action` while holding the blacklist lock, and releases it after. */
+function withBlacklistLock<T>(path: string, action: () => T): T {
+  const lockPath = `${path}.lock`;
+  const lockFd = acquireBlacklistLock(lockPath);
+  try {
+    return action();
   } finally {
     try {
       fs.closeSync(lockFd);
@@ -208,7 +227,15 @@ function acquireBlacklistLock(lockPath: string): number {
         });
       }
 
-      const ageMs = Date.now() - fs.statSync(lockPath).mtimeMs;
+      let lockMtimeMs: number;
+      try {
+        lockMtimeMs = fs.statSync(lockPath).mtimeMs;
+      } catch (statError) {
+        // The holder released the lock between our open and this stat: try the open once more.
+        if ((statError as NodeJS.ErrnoException).code === 'ENOENT') continue;
+        throw statError;
+      }
+      const ageMs = Date.now() - lockMtimeMs;
       if (attempt === 0 && ageMs > BLACKLIST_LOCK_STALE_MS) {
         logger.warn(`[danger-detection] Removing stale blacklist lock at ${lockPath} (${Math.ceil(ageMs)}ms old)`);
         fs.unlinkSync(lockPath);
@@ -228,19 +255,62 @@ function acquireBlacklistLock(lockPath: string): number {
  * so it can never clobber existing safety state.
  */
 export function initBlacklistFile(path: string): boolean {
-  const lockPath = `${path}.lock`;
-  const lockFd = acquireBlacklistLock(lockPath);
-  try {
+  return withBlacklistLock(path, () => {
     if (fs.existsSync(path)) {
       return false;
     }
-    writeBlacklistFile(path, { blacklistedReserves: [], pendingEvacuations: [] });
+    writeBlacklistFile(path, { blacklistedReserves: [], pendingEvacuations: [], depositFreezes: [] });
     return true;
-  } finally {
-    try {
-      fs.closeSync(lockFd);
-    } finally {
-      fs.unlinkSync(lockPath);
+  });
+}
+
+/** The blacklisted reserves and the pending evacuations, as `danger list` prints them. */
+export function formatBlacklistFile(blacklist: BlacklistFile): string {
+  const lines: string[] = [];
+  const section = (title: string, entries: Array<Record<string, string>>, empty: string) => {
+    if (entries.length === 0) {
+      lines.push(empty, '');
+      return;
     }
-  }
+    lines.push(`${title} (${entries.length}):`, '');
+    for (const entry of entries) {
+      for (const [label, value] of Object.entries(entry)) {
+        lines.push(`  ${`${label}:`.padEnd(10)}${value}`);
+      }
+      lines.push('');
+    }
+  };
+  section(
+    'Blacklisted reserves',
+    blacklist.blacklistedReserves.map(({ reserve, triggerName, reason, timestamp }) => ({
+      Reserve: reserve,
+      Trigger: triggerName,
+      Reason: reason,
+      Time: timestamp,
+    })),
+    'No blacklisted reserves.'
+  );
+  // A pending evacuation keeps its vault out of new investment until the vault holds none of the reserve.
+  section(
+    'Pending evacuations',
+    blacklist.pendingEvacuations.map(({ vault, reserve, triggerName, reason, timestamp }) => ({
+      Vault: vault,
+      Reserve: reserve,
+      Trigger: triggerName,
+      Reason: reason,
+      Time: timestamp,
+    })),
+    'No pending evacuations.'
+  );
+  section(
+    'Deposit freezes',
+    blacklist.depositFreezes.map(({ vault, reserve, originalCapLamports, frozenCapLamports, timestamp }) => ({
+      Vault: vault,
+      Reserve: reserve,
+      Cap: `${frozenCapLamports} (was ${originalCapLamports})`,
+      Time: timestamp,
+    })),
+    'No deposit freezes.'
+  );
+  return lines.join('\n').trimEnd();
 }

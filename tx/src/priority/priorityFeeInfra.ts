@@ -2,12 +2,16 @@ import { Address, Rpc } from '@solana/kit';
 import { logger } from 'kvaults-investing-bot-logger';
 import { SOL, TokenAmount } from '../utils/index.js';
 import { AsyncLoadingSlot, TimeBasedReloadingSlot } from '../utils/caching.js';
-import { createDefaultRpc, FeePercentileSupport, RpcEndpointConfig } from '../model/index.js';
+import {
+  createDefaultRpc,
+  DEFAULT_RPC_REQUEST_TIMEOUT_MS,
+  FeePercentileSupport,
+  RpcEndpointConfig,
+} from '../model/index.js';
 import { Fetcher, getAverageFeesPerCUForPeriodLamports, RecentPeriod } from './solanaCompass.js';
 import { GetRecentPrioritizationFeesPercentileApi, getRpcRecentFeesOfPercentile } from './triton.js';
 import { getPriorityFeeEstimate, GetPriorityFeeEstimateApi } from './helius.js';
 
-// TODO(type-safety): have a lib (or own ~20 lines of code) to provide time units safety (see `amounts.ts`)
 const SOLANA_COMPASS_RESPONSE_CACHE_MILLIS = 1000 * 60 * 2; // 2 minutes
 
 /**
@@ -44,6 +48,9 @@ export type ConfiguredPriorityFees = {
   maxPerCu: TokenAmount;
 };
 
+/** A fee-estimate HTTP call with no answer within this window fails, and the chain moves to the next provider. */
+export const DEFAULT_EXTERNAL_REQUEST_TIMEOUT_MS = 30_000;
+
 /**
  * Constructs a list of fee providers from the given RPC endpoint URLs, in their fallback order.
  *
@@ -57,21 +64,25 @@ export type ConfiguredPriorityFees = {
  */
 export function resolvePriorityFeeProviderChain(
   rpcEndpoints: RpcEndpointConfig[],
-  feePercentile: number | undefined
+  feePercentile: number | undefined,
+  externalRequestTimeoutMs: number = DEFAULT_EXTERNAL_REQUEST_TIMEOUT_MS,
+  rpcRequestTimeoutMs: number = DEFAULT_RPC_REQUEST_TIMEOUT_MS
 ): PriorityFeeProvider[] {
   const chain = [];
 
   for (const rpcEndpoint of rpcEndpoints) {
-    const priorityFeeProvider = resolvePriorityFeeProvider(rpcEndpoint, feePercentile);
+    const priorityFeeProvider = resolvePriorityFeeProvider(rpcEndpoint, feePercentile, rpcRequestTimeoutMs);
     if (priorityFeeProvider !== undefined) {
       chain.push(priorityFeeProvider);
     }
   }
 
-  // TODO(rpc-fallbacks): time-limiting for this HTTP call (and others?) can be implemented via decorator here
+  // Every send waits on this estimate, so it carries a deadline; a timeout is a fallback condition.
+  const fetchWithDeadline: Fetcher = (input, init) =>
+    fetch(input, { ...init, signal: AbortSignal.timeout(externalRequestTimeoutMs) });
   chain.push(
     new CachingPriorityFeeProvider(
-      new SolanaCompassPriorityFeeProvider(fetch, RecentPeriod.ONE_MINUTE),
+      new SolanaCompassPriorityFeeProvider(fetchWithDeadline, RecentPeriod.ONE_MINUTE),
       SOLANA_COMPASS_RESPONSE_CACHE_MILLIS
     )
   );
@@ -95,7 +106,7 @@ export function createResilientPriorityFeeProvider(
 ): PriorityFeeProvider {
   const { defaultPerCu, minPerCu, maxPerCu } = configuredFees;
   let chained: PriorityFeeProvider = new TerminatingPriorityFeeProvider();
-  for (const link of chain.reverse()) {
+  for (const link of [...chain].reverse()) {
     chained = new FallbackPriorityFeeProvider(link, chained);
   }
   const capturingLastSuccess = new LastSuccessCapturingPriorityFeeProvider(chained);
@@ -192,12 +203,20 @@ export class FallbackPriorityFeeProvider implements PriorityFeeProvider {
 
   async getPriorityFeeForAccounts(accounts: Address[]): Promise<PriorityFeeResult> {
     try {
-      return await this.primary.getPriorityFeeForAccounts(accounts);
+      return assertUsableFee(await this.primary.getPriorityFeeForAccounts(accounts));
     } catch (e) {
       logger.warn(`Fee provider error; proceeding to its fallback:`, e);
       return this.fallback.getPriorityFeeForAccounts(accounts);
     }
   }
+}
+
+/** A malformed provider response can give NaN; such a fee would make every send fail, so it counts as a provider error. */
+function assertUsableFee(result: PriorityFeeResult): PriorityFeeResult {
+  if (!result.feePerCu.amount.isFinite() || result.feePerCu.amount.isNegative()) {
+    throw new Error(`${result.source} returned an unusable fee ${result.feePerCu.amount} per CU`);
+  }
+  return result;
 }
 
 /**
@@ -272,7 +291,7 @@ export class LastSuccessCapturingPriorityFeeProvider implements PriorityFeeProvi
       return this.lastSuccessfulResult;
     } catch (e) {
       if (this.lastSuccessfulResult === undefined) {
-        throw new Error(`No last successful result available yet`, e);
+        throw new Error(`No last successful result available yet`, { cause: e });
       }
       return {
         feePerCu: this.lastSuccessfulResult.feePerCu,
@@ -337,7 +356,8 @@ export class ClampingPriorityFeeProvider implements PriorityFeeProvider {
 
 function resolvePriorityFeeProvider(
   rpcEndpoint: RpcEndpointConfig,
-  feePercentile: number | undefined
+  feePercentile: number | undefined,
+  rpcRequestTimeoutMs: number
 ): PriorityFeeProvider | undefined {
   if (rpcEndpoint.feePercentileSupport === FeePercentileSupport.None) {
     if (feePercentile !== undefined) {
@@ -357,9 +377,9 @@ function resolvePriorityFeeProvider(
 
   switch (rpcEndpoint.feePercentileSupport) {
     case FeePercentileSupport.TritonStyle:
-      return new TritonPriorityFeeProvider(createDefaultRpc(rpcEndpoint.url), feePercentile);
+      return new TritonPriorityFeeProvider(createDefaultRpc(rpcEndpoint.url, rpcRequestTimeoutMs), feePercentile);
     case FeePercentileSupport.HeliusStyle:
-      return new HeliusPriorityFeeProvider(createDefaultRpc(rpcEndpoint.url), feePercentile);
+      return new HeliusPriorityFeeProvider(createDefaultRpc(rpcEndpoint.url, rpcRequestTimeoutMs), feePercentile);
     default:
       throw new Error(`Unexpected fee percentile support: ${rpcEndpoint.feePercentileSupport}`);
   }

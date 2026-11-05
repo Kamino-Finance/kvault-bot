@@ -4,6 +4,8 @@ import { logger } from 'kvaults-investing-bot-logger';
 const API_URL = 'https://api.kamino.finance';
 const COLLECT_ENDPOINT = '/replay-samples/collect';
 const SERIALIZED_TRANSACTION_ENCODING: BufferEncoding = 'base64';
+/** Fire-and-forget, so a stalled collector must release its socket and buffer soon. */
+const REPORT_TIMEOUT_MS = 10_000;
 
 /**
  * Report a transaction sample to the Kamino API
@@ -12,13 +14,17 @@ const SERIALIZED_TRANSACTION_ENCODING: BufferEncoding = 'base64';
  */
 export async function reportTransactionSample(serializedTransaction: Buffer, description?: string): Promise<void> {
   try {
-    await axios.post(API_URL + COLLECT_ENDPOINT, {
-      description,
-      serializedTransaction: {
-        encoding: SERIALIZED_TRANSACTION_ENCODING,
-        value: serializedTransaction.toString(SERIALIZED_TRANSACTION_ENCODING),
+    await axios.post(
+      API_URL + COLLECT_ENDPOINT,
+      {
+        description,
+        serializedTransaction: {
+          encoding: SERIALIZED_TRANSACTION_ENCODING,
+          value: serializedTransaction.toString(SERIALIZED_TRANSACTION_ENCODING),
+        },
       },
-    });
+      { timeout: REPORT_TIMEOUT_MS }
+    );
     logger.info(`Transaction sample reported for ${description}`);
   } catch (err) {
     // we deliberately do not want the sample-reporting errors to affect sending the tx - that's why we are swallowing it here

@@ -3,6 +3,7 @@ import { KaminoReserve } from '@kamino-finance/klend-sdk';
 import { Decimal } from 'decimal.js';
 import { logger } from 'kvaults-investing-bot-logger';
 import { DangerTrigger, DangerTriggerUnavailableError, TriggerContext, TriggerResult } from '../dangerTypes.js';
+import { StagedObservations } from '../observationStaging.js';
 
 // Relative increase above which the collateral exchange rate is judged anomalous. Deposits and
 // withdrawals preserve the rate exactly and interest accrual only lowers it (see below), so any
@@ -23,7 +24,8 @@ const RATE_INCREASE_TOLERANCE = 0.001;
 export class ExchangeRateTrigger implements DangerTrigger {
   readonly name = 'exchange-rate-anomaly';
   private readonly previousRateByReserve: Map<string, Decimal> = new Map();
-  private readonly pendingRateByReserve: Map<string, Decimal> = new Map();
+  /** Staged per pass generation and reserve; see observationStaging.ts. */
+  private readonly pendingRateByReserve = new StagedObservations<Decimal>();
 
   async check(
     _rpc: Rpc<SolanaRpcApi>,
@@ -52,9 +54,11 @@ export class ExchangeRateTrigger implements DangerTrigger {
       }
       const previousRate = this.previousRateByReserve.get(reserveKey);
       const finish = (result: TriggerResult): TriggerResult => {
-        this.pendingRateByReserve.set(reserveKey, currentRate);
-        if (!context.deferObservationCommit) {
-          this.commitObservation(reserveAddress);
+        const staging = context.observationStaging;
+        if (staging) {
+          this.pendingRateByReserve.stage(staging.generation, reserveKey, currentRate);
+        } else {
+          this.previousRateByReserve.set(reserveKey, currentRate);
         }
         return result;
       };
@@ -88,12 +92,11 @@ export class ExchangeRateTrigger implements DangerTrigger {
     }
   }
 
-  commitObservation(reserveAddress: Address): void {
+  commitObservation(reserveAddress: Address, _reserve: KaminoReserve | undefined, generation: number): void {
     const reserveKey = reserveAddress.toString();
-    const pendingRate = this.pendingRateByReserve.get(reserveKey);
+    const pendingRate = this.pendingRateByReserve.take(generation, reserveKey);
     if (pendingRate !== undefined) {
       this.previousRateByReserve.set(reserveKey, pendingRate);
-      this.pendingRateByReserve.delete(reserveKey);
     }
   }
 }

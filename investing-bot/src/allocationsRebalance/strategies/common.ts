@@ -6,56 +6,83 @@ import {
   KaminoVault,
   LedgerInstant,
   lamportsToDecimal,
-  ReserveAllocationConfig,
-  ReserveWithAddress,
   U64_MAX,
   VaultState,
 } from '@kamino-finance/klend-sdk';
 import { Address, IInstruction, TransactionSigner } from '@solana/kit';
 import { logger } from 'kvaults-investing-bot-logger';
 import BN from 'bn.js';
-import { AllocationWithAPY } from '../utils/maxYieldOptimizers.js';
+import { AllocationWithAPY, getYieldSimulation } from '../utils/maxYieldOptimizers.js';
 import {
   computeVaultTargetAllocation,
-  getVaultTotalAllocationsWeights,
+  simulateVaultYield,
   VaultAllocationProjectionContext,
 } from '../utils/allocationHelper.js';
 import {
   AllocationWeightBounds,
   applyReserveConstraints,
   calculateReserveAllocationWeightBounds,
+  calculateTotalWeight,
   getTargetTokenConstraintType,
   normalizeWeightsToTotal,
   redistributeWeightDifferenceWithinBounds,
   ReserveConstraints,
 } from '../utils/allocationConstraints.js';
-import {
-  getAllocationCapInTokensOrDefault,
-  getVaultAllocationForReserve,
-  shouldUpdateAllocation,
-} from '../vaultUtils.js';
-import { getInvestedReservesForUniverse } from '../rebalanceUniverse.js';
+import { buildWeightUpdateIx, getReserveAllocationsMap, getVaultAllocationForReserve } from '../vaultUtils.js';
+import { filterToUniverse } from '../rebalanceUniverse.js';
+import { MIN_ALLOCATION_WEIGHT_TOTAL } from '../consts.js';
+import type { StrategyContext } from '../strategyRegistry.js';
 
 /**
  * Common vault context needed for allocation strategies
  */
 export interface VaultContext {
   vaultState: VaultState;
+  /** The weight total the pipeline writes for the reserves outside reinvest cooldown (see getAllocationWeightTotal). */
   totalAllocationsWeights: Decimal;
+  /** The whole factor the vault's on-chain weights are raised by; 1 keeps them. */
+  weightScale: Decimal;
+  /** The on-chain weights of the healthy reserves, in vault order. */
+  healthyWeights: ReadonlyMap<Address, Decimal>;
+  /** AUM available to the optimizer, excluding holdings in preserved reserves, in tokens. */
   vaultAUMTokens: Decimal;
   investedInReservesTokensMap: Map<Address, Decimal>;
   allInvestedInReservesTokensMap: Map<Address, Decimal>;
   allocationProjectionContext: VaultAllocationProjectionContext;
 }
 
-function getRebalancedAllocationWeight(vaultState: VaultState, preservedReserves: ReadonlySet<string>): Decimal {
-  let rebalancedWeight = getVaultTotalAllocationsWeights(vaultState);
-  for (const allocation of vaultState.vaultAllocationStrategy) {
-    if (preservedReserves.has(allocation.reserve.toString())) {
-      rebalancedWeight = rebalancedWeight.sub(allocation.targetAllocationWeight.toString());
-    }
+export interface AllocationWeightTotal {
+  /** The weight total the pipeline writes for the reserves outside reinvest cooldown. */
+  total: Decimal;
+  /** The whole factor the vault's on-chain weights are raised by; 1 keeps them. */
+  scale: Decimal;
+}
+
+/**
+ * The reserve weight total the pipeline writes. It keeps the vault's total, so the share the vault leaves unallocated
+ * stays the same: the allocation admin cannot change `unallocatedWeight`. A vault with no unallocated weight and a total
+ * under MIN_ALLOCATION_WEIGHT_TOTAL has its weights raised by a whole factor, so a weight unit is a finer share and
+ * rounding moves less. The raise waits while a reserve in reinvest cooldown holds weight, because it would rewrite it.
+ */
+export function getAllocationWeightTotal(
+  vaultState: VaultState,
+  preservedReserves: ReadonlySet<string>
+): AllocationWeightTotal {
+  const vaultWeights = getReserveAllocationsMap(vaultState);
+  const vaultWeight = calculateTotalWeight(vaultWeights);
+  const rebalancedWeight = calculateTotalWeight(
+    new Map([...vaultWeights].filter(([reserve]) => !preservedReserves.has(reserve.toString())))
+  );
+  const canRaise =
+    new Decimal(vaultState.unallocatedWeight.toString()).eq(0) &&
+    rebalancedWeight.eq(vaultWeight) &&
+    vaultWeight.gt(0) &&
+    vaultWeight.lt(MIN_ALLOCATION_WEIGHT_TOTAL);
+  if (!canRaise) {
+    return { total: rebalancedWeight, scale: new Decimal(1) };
   }
-  return rebalancedWeight;
+  const scale = new Decimal(MIN_ALLOCATION_WEIGHT_TOTAL).div(vaultWeight).ceil();
+  return { total: rebalancedWeight.mul(scale), scale };
 }
 
 function getRebalancedVaultAUMTokens(
@@ -85,7 +112,10 @@ export async function getVaultContext(
   forcedZeroReserves: ReadonlySet<string> = new Set()
 ): Promise<VaultContext> {
   const vaultState = await kaminoVault.getState();
-  const totalAllocationsWeights = getRebalancedAllocationWeight(vaultState, preservedReserves);
+  const { total: totalAllocationsWeights, scale: weightScale } = getAllocationWeightTotal(
+    vaultState,
+    preservedReserves
+  );
 
   const vaultHoldings = await kaminoManager.getVaultHoldings(
     vaultState,
@@ -99,15 +129,14 @@ export async function getVaultContext(
     vaultHoldings.investedInReserves,
     preservedReserves
   );
-  const investedInReservesTokensMap = getInvestedReservesForUniverse(
-    vaultHoldings.investedInReserves,
-    optimizationReserves
-  );
+  const investedInReservesTokensMap = filterToUniverse(vaultHoldings.investedInReserves, optimizationReserves);
   const currentVaultAllocations = kaminoManager.getVaultAllocations(vaultState);
 
   return {
     vaultState,
     totalAllocationsWeights,
+    weightScale,
+    healthyWeights: filterToUniverse(getReserveAllocationsMap(vaultState), optimizationReserves),
     vaultAUMTokens,
     investedInReservesTokensMap,
     allInvestedInReservesTokensMap: vaultHoldings.investedInReserves,
@@ -130,15 +159,9 @@ export function logAllocationResult(
   kaminoVault: KaminoVault,
   strategyName: string,
   allocation: AllocationWithAPY,
-  reservesWithMinAllocation: Address[],
   stabilizationFactor?: Decimal
 ): void {
-  let strategyString = strategyName;
-  if (reservesWithMinAllocation.length > 0) {
-    strategyString = `${strategyName}_WITH_FIXED_RESERVES`;
-  }
-
-  let logMsg = `[allocation-rebalance-loop] Rebalancing allocation for vault ${kaminoVault.address.toString()}; strategy: ${strategyString}`;
+  let logMsg = `[allocation-rebalance-loop] Rebalancing allocation for vault ${kaminoVault.address.toString()}; strategy: ${strategyName}`;
 
   if (stabilizationFactor !== undefined) {
     logMsg += `; stabilization factor: ${stabilizationFactor.toString()}`;
@@ -196,53 +219,127 @@ export function buildReserveConstraintsBase(
 }
 
 /**
- * Builds allocation rebalance instructions from allocation results
+ * The APY of `weights` over the healthy reserves, with the same farms-aware computation the grid search uses to
+ * score candidates. The caller guarantees a positive weight total.
+ */
+export async function computeWeightsApy(ctx: StrategyContext, weights: Map<Address, Decimal>): Promise<Decimal> {
+  const proposedWeights = new Map<Address, Decimal>();
+  for (const reserve of ctx.vaultContext.healthyWeights.keys()) {
+    proposedWeights.set(reserve, weights.get(reserve) ?? new Decimal(0));
+  }
+  return (await simulateVaultYield(proposedWeights, getYieldSimulation(ctx))).apy;
+}
+
+/** The strategy inputs the instruction builders read. */
+export type InstructionBuilderContext = Pick<
+  StrategyContext,
+  'kaminoManager' | 'kaminoVault' | 'healthyVaultsReserves' | 'vaultContext' | 'currentLedgerInstant'
+>;
+
+/**
+ * The weights a strategy without preserved accounting writes: `targetWeights` scaled to the vault's weight total (see
+ * getAllocationWeightTotal), which keeps the strategy's shares and the share the vault leaves unallocated. An
+ * unallocated vault, or an all-zero target, keeps the target as the strategy set it.
+ */
+export function getAbsoluteWeights(
+  vaultContext: VaultContext,
+  targetWeights: Map<Address, Decimal>
+): Map<Address, Decimal> {
+  const weightTotal = vaultContext.totalAllocationsWeights;
+  return weightTotal.gt(0) && calculateTotalWeight(targetWeights).gt(0)
+    ? normalizeWeightsToTotal(targetWeights, weightTotal)
+    : targetWeights;
+}
+
+/**
+ * Builds one update per reserve whose weight in `weights` (see getAbsoluteWeights) differs from its on-chain weight. No
+ * constraints apply.
+ */
+export async function buildAbsoluteWeightInstructions(
+  ctx: InstructionBuilderContext,
+  weights: Map<Address, Decimal>,
+  signer: TransactionSigner
+): Promise<IInstruction[]> {
+  const { kaminoManager, kaminoVault, healthyVaultsReserves, vaultContext } = ctx;
+  const { vaultState } = vaultContext;
+  const allocationRebalanceIxs: IInstruction[] = [];
+  for (const [reserve, targetWeight] of weights) {
+    const kaminoReserveState = healthyVaultsReserves.get(reserve);
+    if (!kaminoReserveState) {
+      throw new Error(`Reserve ${reserve} not found`);
+    }
+    const weight = Math.round(targetWeight.toNumber());
+    const updateIx = await buildWeightUpdateIx(
+      kaminoManager,
+      kaminoVault,
+      vaultState,
+      { address: reserve, state: kaminoReserveState.state },
+      weight,
+      signer
+    );
+    if (updateIx) {
+      logger.info(
+        `[allocation-rebalance-loop] Updating reserve allocation for vault ${kaminoVault.address.toString()} with reserve ${reserve} to weight ${weight}`
+      );
+      allocationRebalanceIxs.push(updateIx);
+    }
+  }
+  return allocationRebalanceIxs;
+}
+
+/** The update instructions and the healthy reserve weights the vault holds once they land. */
+export interface WeightUpdate {
+  ixns: IInstruction[];
+  weights: Map<Address, Decimal>;
+}
+
+export class FinalAllocationConstraintError extends Error {
+  constructor(vaultAddress: Address, options?: ErrorOptions) {
+    super(
+      options
+        ? `Cannot validate strategy limits for vault ${vaultAddress}`
+        : `Final allocation exceeds strategy limits for vault ${vaultAddress}`,
+      options
+    );
+    this.name = 'FinalAllocationConstraintError';
+  }
+}
+
+/**
+ * Builds allocation rebalance instructions from allocation results. When it stays put, it returns no instructions and
+ * the current weights.
  */
 export async function buildAllocationRebalanceInstructions(
-  kaminoManager: KaminoManager,
-  kaminoVault: KaminoVault,
-  vaultState: VaultState,
-  vaultsReserves: Map<Address, KaminoReserve>,
+  ctx: InstructionBuilderContext,
   proposedAllocation: AllocationWithAPY,
   signer: TransactionSigner,
-  currentLedgerInstant: LedgerInstant,
-  allVaultReserves: Map<Address, KaminoReserve> = vaultsReserves,
-  preservedReserves: ReadonlySet<string> = new Set(),
-  forcedZeroReserves: ReadonlySet<string> = new Set()
-): Promise<IInstruction[]> {
+  allocationFilter?: (weights: Map<Address, Decimal>) => boolean
+): Promise<WeightUpdate> {
+  const { kaminoManager, kaminoVault, healthyVaultsReserves, vaultContext, currentLedgerInstant } = ctx;
+  const { vaultState, allocationProjectionContext } = vaultContext;
+  const investedInReservesTokens = vaultContext.allInvestedInReservesTokensMap;
   const allocationRebalanceIxs: IInstruction[] = [];
-
-  const vaultHoldings = await kaminoManager.getVaultHoldings(
-    vaultState,
-    currentLedgerInstant,
-    allVaultReserves,
-    currentLedgerInstant
-  );
-  const investedInReservesTokens = vaultHoldings.investedInReserves;
-  const totalVaultAUMTokens = Decimal.max(vaultHoldings.totalAUMIncludingFees.sub(vaultHoldings.pendingFees), 0);
-  const rebalancedVaultAUMTokens = getRebalancedVaultAUMTokens(
-    totalVaultAUMTokens,
-    investedInReservesTokens,
-    preservedReserves
-  );
+  const stayPut = (): WeightUpdate => {
+    const weights = new Map(vaultContext.healthyWeights);
+    if (allocationFilter && !allocationFilter(weights)) {
+      throw new FinalAllocationConstraintError(kaminoVault.address);
+    }
+    return { ixns: [], weights };
+  };
 
   // Redistribute blacklisted weight across the active universe, but leave cooldown
   // weight untouched because that reserve remains configured and invested.
-  const totalTargetWeight = getRebalancedAllocationWeight(vaultState, preservedReserves);
+  const totalTargetWeight = vaultContext.totalAllocationsWeights;
   const weightsForAUMProjection = totalTargetWeight.gt(0)
     ? normalizeWeightsToTotal(proposedAllocation.reservesWithAllocation, totalTargetWeight)
     : proposedAllocation.reservesWithAllocation;
-  const projectedUnallocatedTokens = computeVaultTargetAllocation(weightsForAUMProjection, {
-    vaultState,
-    vaultAUMTokens: totalVaultAUMTokens,
-    currentVaultAllocations: kaminoManager.getVaultAllocations(vaultState),
-    allVaultReserves,
-    currentLedgerInstant,
-    forcedZeroReserves,
-  }).targetUnallocatedAmount;
+  const projectedUnallocatedTokens = computeVaultTargetAllocation(
+    weightsForAUMProjection,
+    allocationProjectionContext
+  ).targetUnallocatedAmount;
   // Weight bounds apply only to tokens the SDK projects into reserves; including the unallocated
   // target would inflate every reserve's proportional token target.
-  const aumTokens = Decimal.max(rebalancedVaultAUMTokens.sub(projectedUnallocatedTokens), 0);
+  const aumTokens = Decimal.max(vaultContext.vaultAUMTokens.sub(projectedUnallocatedTokens), 0);
 
   // Create a copy of the allocation to modify
   const adjustedAllocation = new Map<Address, Decimal>();
@@ -252,6 +349,7 @@ export async function buildAllocationRebalanceInstructions(
 
   // First pass: derive every reserve's safe interval and clamp direct violations
   const weightBounds = new Map<Address, AllocationWeightBounds>();
+  const baseConstraints = new Map<Address, Omit<ReserveConstraints, 'targetWeight'>>();
 
   for (const [reserveToUpdate, targetWeight] of adjustedAllocation) {
     const allocForReserve = getVaultAllocationForReserve(vaultState, reserveToUpdate);
@@ -266,25 +364,25 @@ export async function buildAllocationRebalanceInstructions(
       continue;
     }
 
-    const reserve = vaultsReserves.get(reserveToUpdate);
+    const reserve = healthyVaultsReserves.get(reserveToUpdate);
     if (!reserve) {
       logger.error(`Reserve ${reserveToUpdate} not found in vault reserves`);
       continue;
     }
 
-    const currentWeight = new Decimal(allocForReserve.targetAllocationWeight.toString());
+    // Match the weight scale selected for this pass.
+    const currentWeight = new Decimal(allocForReserve.targetAllocationWeight.toString()).mul(vaultContext.weightScale);
 
     // Build constraints object (shared with the MAX_YIELD_DRIPPING utilization filter).
-    const constraints: ReserveConstraints = {
-      ...buildReserveConstraintsBase(
-        reserveToUpdate,
-        reserve,
-        currentWeight,
-        investedTokensInReserve,
-        currentLedgerInstant
-      ),
-      targetWeight,
-    };
+    const base = buildReserveConstraintsBase(
+      reserveToUpdate,
+      reserve,
+      currentWeight,
+      investedTokensInReserve,
+      currentLedgerInstant
+    );
+    baseConstraints.set(reserveToUpdate, base);
+    const constraints: ReserveConstraints = { ...base, targetWeight };
     weightBounds.set(
       reserveToUpdate,
       calculateReserveAllocationWeightBounds(constraints, aumTokens, totalTargetWeight)
@@ -307,7 +405,7 @@ export async function buildAllocationRebalanceInstructions(
   if (totalTargetWeight.gt(0)) {
     if (weightBounds.size !== adjustedAllocation.size) {
       logger.warn(`[allocation-rebalance-loop] Cannot derive reserve bounds for every allocation. Staying put.`);
-      return [];
+      return stayPut();
     }
     const redistributionResult = redistributeWeightDifferenceWithinBounds(
       adjustedAllocation,
@@ -318,43 +416,45 @@ export async function buildAllocationRebalanceInstructions(
       logger.warn(
         `[allocation-rebalance-loop] Cannot conserve total allocation weight ${totalTargetWeight} within reserve deposit and withdrawal bounds. Staying put.`
       );
-      return [];
+      return stayPut();
     }
     finalAllocation = redistributionResult.allocation;
   }
 
-  const targetAllocation = computeVaultTargetAllocation(finalAllocation, {
-    vaultState,
-    vaultAUMTokens: totalVaultAUMTokens,
-    currentVaultAllocations: kaminoManager.getVaultAllocations(vaultState),
-    allVaultReserves,
-    currentLedgerInstant,
-    forcedZeroReserves,
-  });
-  for (const [reserveAddress] of finalAllocation) {
-    const reserve = vaultsReserves.get(reserveAddress);
+  const writtenWeights = new Map(
+    [...finalAllocation].map(([reserve, weight]) => [reserve, new Decimal(Math.round(weight.toNumber()))])
+  );
+  const targetAllocation = computeVaultTargetAllocation(writtenWeights, allocationProjectionContext);
+  for (const [reserveAddress] of writtenWeights) {
+    const reserve = healthyVaultsReserves.get(reserveAddress);
     const allocForReserve = getVaultAllocationForReserve(vaultState, reserveAddress);
     if (!reserve || !allocForReserve) {
       logger.warn(
         `[allocation-rebalance-loop] Cannot validate canonical target for reserve ${reserveAddress}. Staying put.`
       );
-      return [];
+      return stayPut();
     }
-    const constraints = buildReserveConstraintsBase(
-      reserveAddress,
-      reserve,
-      new Decimal(allocForReserve.targetAllocationWeight.toString()),
-      investedInReservesTokens.get(reserveAddress) ?? new Decimal(0),
-      currentLedgerInstant
-    );
+    const constraints =
+      baseConstraints.get(reserveAddress) ??
+      buildReserveConstraintsBase(
+        reserveAddress,
+        reserve,
+        new Decimal(allocForReserve.targetAllocationWeight.toString()),
+        investedInReservesTokens.get(reserveAddress) ?? new Decimal(0),
+        currentLedgerInstant
+      );
     const targetTokens = targetAllocation.targetReservesAllocation.get(reserveAddress) ?? new Decimal(0);
     const constraintType = getTargetTokenConstraintType(constraints, targetTokens);
     if (constraintType !== 'none') {
       logger.warn(
         `[allocation-rebalance-loop] Canonical target ${targetTokens} for reserve ${reserveAddress} exceeds its ${constraintType} capacity. Staying put.`
       );
-      return [];
+      return stayPut();
     }
+  }
+
+  if (allocationFilter && !allocationFilter(writtenWeights)) {
+    throw new FinalAllocationConstraintError(kaminoVault.address);
   }
 
   // Log redistribution results
@@ -365,40 +465,21 @@ export async function buildAllocationRebalanceInstructions(
     }
   }
 
-  // Final pass: build instructions with adjusted weights
-  for (const [reserveToUpdate, adjustedWeight] of finalAllocation) {
-    const allocForReserve = getVaultAllocationForReserve(vaultState, reserveToUpdate);
-    if (!allocForReserve) {
-      continue;
-    }
-
-    const currentWeight = new Decimal(allocForReserve.targetAllocationWeight.toString());
-    const weightDelta = adjustedWeight.sub(currentWeight);
-
-    if (!weightDelta.eq(0)) {
-      const reserveWithConfig: ReserveWithAddress = {
-        address: reserveToUpdate,
-        state: vaultsReserves.get(reserveToUpdate)!.state,
-      };
-
-      const allocationCapTokens = getAllocationCapInTokensOrDefault(vaultState, reserveToUpdate);
-      const reserveAllocationConfig: ReserveAllocationConfig = new ReserveAllocationConfig(
-        reserveWithConfig,
-        Math.round(adjustedWeight.toNumber()), // Ensure integer weight
-        allocationCapTokens
-      );
-
-      const shouldUpdateAlloc = shouldUpdateAllocation(vaultState, reserveAllocationConfig);
-      if (shouldUpdateAlloc) {
-        const updateAllocationIxs = await kaminoManager.updateVaultReserveAllocationIxs(
-          kaminoVault,
-          reserveAllocationConfig,
-          signer
-        );
-        allocationRebalanceIxs.push(updateAllocationIxs.updateReserveAllocationIx);
-      }
+  // Final pass: build instructions with adjusted weights. The validation above found every reserve.
+  for (const [reserveToUpdate, adjustedWeight] of writtenWeights) {
+    const weight = adjustedWeight.toNumber();
+    const updateIx = await buildWeightUpdateIx(
+      kaminoManager,
+      kaminoVault,
+      vaultState,
+      { address: reserveToUpdate, state: healthyVaultsReserves.get(reserveToUpdate)!.state },
+      weight,
+      signer
+    );
+    if (updateIx) {
+      allocationRebalanceIxs.push(updateIx);
     }
   }
 
-  return allocationRebalanceIxs;
+  return { ixns: allocationRebalanceIxs, weights: writtenWeights };
 }

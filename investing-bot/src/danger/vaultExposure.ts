@@ -1,6 +1,7 @@
 import { Decimal } from 'decimal.js';
 import { KaminoManager, VaultState } from '@kamino-finance/klend-sdk';
 import { Address } from '@solana/kit';
+import { readBlacklistFile } from './blacklistStore.js';
 
 export function vaultHasExposureToReserves(
   kaminoManager: KaminoManager,
@@ -30,5 +31,30 @@ export function shouldBlockVaultInvestmentForDanger(
   return (
     pendingEvacuations.size > 0 ||
     vaultHasExposureToReserves(kaminoManager, vaultState, investedInReservesTokens, blacklistedReserves)
+  );
+}
+
+/**
+ * Reads the blacklist file once on every call. The danger coordinator saves a blacklisted reserve before it zeroes
+ * the vault weights one vault at a time, so a blacklist read once per pass misses a reserve blacklisted mid-pass.
+ */
+export function shouldBlockVaultInvestmentForDangerNow(
+  blacklistPath: string,
+  kaminoManager: KaminoManager,
+  vaultAddress: Address,
+  vaultState: VaultState,
+  investedInReservesTokens: Map<Address, Decimal>
+): boolean {
+  const blacklist = readBlacklistFile(blacklistPath);
+  return shouldBlockVaultInvestmentForDanger(
+    kaminoManager,
+    vaultState,
+    investedInReservesTokens,
+    new Set(blacklist.blacklistedReserves.map(({ reserve }) => reserve)),
+    new Set(
+      blacklist.pendingEvacuations
+        .filter(({ vault }) => vault === vaultAddress.toString())
+        .map(({ reserve }) => reserve)
+    )
   );
 }

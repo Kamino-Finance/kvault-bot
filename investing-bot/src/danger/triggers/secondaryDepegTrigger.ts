@@ -174,7 +174,13 @@ export class SecondaryDepegTrigger implements DangerTrigger {
 
       const { divergenceBps, safeBps, maxBps, details } =
         peg.kind === 'usd'
-          ? this.measureDollarPeg(mintAddress, peg.priceUsd, marketPrice, reserve)
+          ? this.measureDollarPeg(
+              mintAddress,
+              peg.priceUsd,
+              marketPrice,
+              reserve,
+              context.scopeOracleObservations?.get(reserveAddress)?.kind === 'zero'
+            )
           : this.measureTokenPeg(mintAddress, peg, marketPrice, context);
 
       let safetyScore: number;
@@ -206,7 +212,8 @@ export class SecondaryDepegTrigger implements DangerTrigger {
     mintAddress: Address,
     pegPriceUsd: number,
     marketPrice: Decimal,
-    reserve: KaminoReserve
+    reserve: KaminoReserve,
+    scopeZero: boolean
   ): { divergenceBps: number; safeBps: number; maxBps: number; details: string } {
     const peg = new Decimal(pegPriceUsd);
     if (!peg.isFinite() || peg.lte(0)) {
@@ -216,7 +223,7 @@ export class SecondaryDepegTrigger implements DangerTrigger {
     const marketBps = peg.sub(marketPrice).abs().div(peg).mul(FULL_BPS).toNumber();
     // The SDK flags a price it cannot trust; an untrusted oracle is `oracle-divergence`'s business, so
     // here it is simply left out of the comparison rather than scored as a divergence of its own.
-    const oraclePrice = reserve.tokenOraclePrice.valid ? reserve.tokenOraclePrice.price : undefined;
+    const oraclePrice = !scopeZero && reserve.tokenOraclePrice.valid ? reserve.tokenOraclePrice.price : undefined;
     const oracleBps =
       oraclePrice && oraclePrice.isFinite() && oraclePrice.gt(0)
         ? peg.sub(oraclePrice).abs().div(peg).mul(FULL_BPS).toNumber()
@@ -226,7 +233,7 @@ export class SecondaryDepegTrigger implements DangerTrigger {
     const implausible = this.reportImplausiblePeg(mintAddress, marketPrice, peg, 'USD');
     const details =
       `mint ${mintAddress}: market ${marketPrice.toFixed(6)} (${marketBps.toFixed(0)} bps) and ` +
-      `oracle ${oraclePrice ? `${oraclePrice.toFixed(6)} (${oracleBps!.toFixed(0)} bps)` : 'unavailable'} ` +
+      `oracle ${oracleBps !== undefined ? `${oraclePrice!.toFixed(6)} (${oracleBps.toFixed(0)} bps)` : 'unavailable'} ` +
       `vs ${peg.toFixed(6)} USD peg, worst=${divergenceBps.toFixed(0)} bps` +
       (implausible ? ' [IMPLAUSIBLE PEG: verify this token is really worth $1]' : '');
 

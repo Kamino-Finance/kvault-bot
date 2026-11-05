@@ -1,12 +1,15 @@
 import { Decimal } from 'decimal.js';
 import {
+  KaminoManager,
+  KaminoVault,
   lamportsToDecimal,
   numberToLamportsDecimal,
   ReserveAllocationConfig,
+  ReserveWithAddress,
   VaultAllocation,
   VaultState,
 } from '@kamino-finance/klend-sdk';
-import { Address } from '@solana/kit';
+import { Address, IInstruction, TransactionSigner } from '@solana/kit';
 import { DEFAULT_PUBLIC_KEY } from 'kvaults-investing-bot-tx/instruction';
 import { MAX_ALLOCATION_CAP_IN_LAMPORTS } from './consts.js';
 
@@ -24,12 +27,8 @@ export function getVaultAllocationForReserve(vaultState: VaultState, reserve: Ad
   return vaultState.vaultAllocationStrategy.find((a) => a.reserve === reserve);
 }
 
-export function getAllocationCapInTokensOrDefault(
-  vaultState: VaultState,
-  reserve: Address,
-  defaultCapInLamports: Decimal = new Decimal(MAX_ALLOCATION_CAP_IN_LAMPORTS)
-): Decimal {
-  let capInLamports = defaultCapInLamports;
+function getAllocationCapInTokensOrDefault(vaultState: VaultState, reserve: Address): Decimal {
+  let capInLamports = new Decimal(MAX_ALLOCATION_CAP_IN_LAMPORTS);
   const allocForReserve = getVaultAllocationForReserve(vaultState, reserve);
   if (allocForReserve) {
     capInLamports = new Decimal(allocForReserve.tokenAllocationCap.toString());
@@ -38,7 +37,7 @@ export function getAllocationCapInTokensOrDefault(
 }
 
 /// this impl assumes the new config has cap in tokens, not lamports
-export function shouldUpdateAllocation(vaultState: VaultState, reserveAllocConfig: ReserveAllocationConfig): boolean {
+function shouldUpdateAllocation(vaultState: VaultState, reserveAllocConfig: ReserveAllocationConfig): boolean {
   const allocForReserve = getVaultAllocationForReserve(vaultState, reserveAllocConfig.reserve.address);
   if (!allocForReserve) {
     return false;
@@ -56,4 +55,51 @@ export function shouldUpdateAllocation(vaultState: VaultState, reserveAllocConfi
 
   const allocationUnchanged = weightIsEqual && capIsEqual;
   return !allocationUnchanged;
+}
+
+/** The instruction that sets `reserve`'s weight in the vault and keeps its cap, or undefined when nothing changes. */
+export async function buildWeightUpdateIx(
+  kaminoManager: KaminoManager,
+  kaminoVault: KaminoVault,
+  vaultState: VaultState,
+  reserve: ReserveWithAddress,
+  weight: number,
+  signer: TransactionSigner
+): Promise<IInstruction | undefined> {
+  const config = new ReserveAllocationConfig(
+    reserve,
+    weight,
+    getAllocationCapInTokensOrDefault(vaultState, reserve.address)
+  );
+  if (!shouldUpdateAllocation(vaultState, config)) {
+    return undefined;
+  }
+  return (await kaminoManager.updateVaultReserveAllocationIxs(kaminoVault, config, signer)).updateReserveAllocationIx;
+}
+
+/**
+ * The instruction that sets `reserve`'s token allocation cap in the vault, in vault-token lamports, and keeps its weight;
+ * undefined when the reserve is not in the vault or nothing changes. The cToken cap keeps its on-chain value.
+ */
+export async function buildCapUpdateIx(
+  kaminoManager: KaminoManager,
+  kaminoVault: KaminoVault,
+  vaultState: VaultState,
+  reserve: ReserveWithAddress,
+  capLamports: Decimal,
+  signer: TransactionSigner
+): Promise<IInstruction | undefined> {
+  const allocation = getVaultAllocationForReserve(vaultState, reserve.address);
+  if (!allocation) {
+    return undefined;
+  }
+  const config = new ReserveAllocationConfig(
+    reserve,
+    allocation.targetAllocationWeight.toNumber(),
+    lamportsToDecimal(capLamports, vaultState.tokenMintDecimals.toNumber())
+  );
+  if (!shouldUpdateAllocation(vaultState, config)) {
+    return undefined;
+  }
+  return (await kaminoManager.updateVaultReserveAllocationIxs(kaminoVault, config, signer)).updateReserveAllocationIx;
 }

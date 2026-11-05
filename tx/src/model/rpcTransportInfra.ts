@@ -29,6 +29,9 @@ const MULTICASTED_METHOD_NAMES: string[] = ['sendTransaction' as const satisfies
  * Names of Solana RPC methods that are related to "writing" operations.
  */
 const WRITING_METHOD_NAMES: string[] = [
+  // The submission itself goes to the dedicated send endpoint too, next to the blockhash and simulation
+  // reads it depends on; otherwise a configured send RPC is bypassed and the read node's slot may lag.
+  'sendTransaction' as const satisfies keyof SendTransactionApi,
   'getEpochInfo' as const satisfies keyof GetEpochInfoApi,
   'getLatestBlockhash' as const satisfies keyof GetLatestBlockhashApi,
   'getTransaction' as const satisfies keyof GetTransactionApi,
@@ -77,12 +80,15 @@ export type ReadWriteRpcCallers = {
  */
 export function resolveRpcCallerChain(
   regularRpcEndpoints: RpcEndpointConfig[],
-  multicastRpcUrls: RpcUrl[]
+  multicastRpcUrls: RpcUrl[],
+  requestTimeoutMs: number = DEFAULT_RPC_REQUEST_TIMEOUT_MS
 ): RpcCallerChain {
   const readWriteRpcChain = regularRpcEndpoints.map((regularRpcEndpoint) =>
-    resolveReadWriteRpcCallers(regularRpcEndpoint)
+    resolveReadWriteRpcCallers(regularRpcEndpoint, requestTimeoutMs)
   );
-  const multicastRpcs = new Set(multicastRpcUrls.map((multicastRpcUrl) => createUrlRpcCaller(multicastRpcUrl)));
+  const multicastRpcs = new Set(
+    multicastRpcUrls.map((multicastRpcUrl) => createUrlRpcCaller(multicastRpcUrl, requestTimeoutMs))
+  );
   return { readWriteRpcChain, multicastRpcs };
 }
 
@@ -106,12 +112,11 @@ export function resolveRpcCallerChain(
  */
 export function createResilientRpc<TExtraMethods>(rpcCallerChain: RpcCallerChain): Rpc<RpcMethodTypes & TExtraMethods> {
   let resilientRpcCaller: RpcCaller = new TerminatingRpcCaller();
-  for (const readWriteRpcCallers of rpcCallerChain.readWriteRpcChain.reverse()) {
+  for (const readWriteRpcCallers of [...rpcCallerChain.readWriteRpcChain].reverse()) {
     const linkRpcCaller =
       readWriteRpcCallers.dedicatedWriteRpcCaller !== undefined
         ? withDedicatedWrite(readWriteRpcCallers.regularRpcCaller, readWriteRpcCallers.dedicatedWriteRpcCaller)
         : readWriteRpcCallers.regularRpcCaller;
-    // TODO(rpc-fallbacks): we could achieve a "cooldown period for extended downtime" here via wrapping each link in a circuit-breaker decorator:
     resilientRpcCaller = new FallbackRpcCaller(linkRpcCaller, resilientRpcCaller);
   }
   if (rpcCallerChain.multicastRpcs.size > 0) {
@@ -127,8 +132,11 @@ export function createResilientRpc<TExtraMethods>(rpcCallerChain: RpcCallerChain
 /**
  * Creates a "plain" RPC from a single URL.
  */
-export function createDefaultRpc<TExtraMethods>(url: RpcUrl): Rpc<RpcMethodTypes & TExtraMethods> {
-  return asRpc(createUrlRpcCaller(url));
+export function createDefaultRpc<TExtraMethods>(
+  url: RpcUrl,
+  requestTimeoutMs: number = DEFAULT_RPC_REQUEST_TIMEOUT_MS
+): Rpc<RpcMethodTypes & TExtraMethods> {
+  return asRpc(createUrlRpcCaller(url, requestTimeoutMs));
 }
 
 // only exposed for tests:
@@ -149,11 +157,13 @@ function asRpcTransport(rpcCaller: RpcCaller): RpcTransport {
   return rpcCaller.call.bind(rpcCaller) as RpcTransport;
 }
 
-function resolveReadWriteRpcCallers(rpcEndpoint: RpcEndpointConfig): ReadWriteRpcCallers {
+function resolveReadWriteRpcCallers(rpcEndpoint: RpcEndpointConfig, requestTimeoutMs: number): ReadWriteRpcCallers {
   return {
-    regularRpcCaller: createUrlRpcCaller(rpcEndpoint.url),
+    regularRpcCaller: createUrlRpcCaller(rpcEndpoint.url, requestTimeoutMs),
     dedicatedWriteRpcCaller:
-      rpcEndpoint.dedicatedWriteUrl !== undefined ? createUrlRpcCaller(rpcEndpoint.dedicatedWriteUrl) : undefined,
+      rpcEndpoint.dedicatedWriteUrl !== undefined
+        ? createUrlRpcCaller(rpcEndpoint.dedicatedWriteUrl, requestTimeoutMs)
+        : undefined,
   };
 }
 
@@ -162,8 +172,31 @@ export function withDedicatedWrite(regularRpcCaller: RpcCaller, dedicatedWriteRp
   return new MethodRoutingRpcTransport(regularRpcCaller, WRITING_METHOD_NAMES, dedicatedWriteRpcCaller);
 }
 
-function createUrlRpcCaller({ url, representation }: RpcUrl): RpcCaller {
-  return new LabelledRpcCaller(createDefaultRpcTransport({ url }), representation);
+/** An RPC call with no answer within this window fails, so a stalled socket cannot hold a loop. */
+export const DEFAULT_RPC_REQUEST_TIMEOUT_MS = 2 * 60_000;
+
+function createUrlRpcCaller({ url, representation }: RpcUrl, requestTimeoutMs: number): RpcCaller {
+  return new LabelledRpcCaller(
+    withRequestTimeout(createDefaultRpcTransport({ url }), requestTimeoutMs),
+    representation
+  );
+}
+
+/** Bounds every call through the transport with a deadline, combined with any signal the caller passes. */
+function withRequestTimeout(transport: RpcTransport, requestTimeoutMs: number): RpcTransport {
+  return ((config: Parameters<RpcTransport>[0]) => {
+    const deadline = AbortSignal.timeout(requestTimeoutMs);
+    const signal = config.signal ? AbortSignal.any([config.signal, deadline]) : deadline;
+    return transport({ ...config, signal });
+  }) as RpcTransport;
+}
+
+/** All configured RPC endpoints failed for one request. */
+export class RpcRequestError extends Error {
+  constructor(cause: unknown) {
+    super(`All RPCs failed; last error: ${cause instanceof Error ? cause.message : String(cause)}`, { cause });
+    this.name = 'RpcRequestError';
+  }
 }
 
 class FallbackRpcCaller implements RpcCaller {
@@ -180,6 +213,10 @@ class FallbackRpcCaller implements RpcCaller {
       return FallbackRpcCaller.checkResponseSuccessful(await this.primary.call(...args));
     } catch (e) {
       logger.warn(`Calling RPC ${this.primary} failed; proceeding to its fallback:`, e);
+      if (this.fallback instanceof TerminatingRpcCaller) {
+        // The caller gets the last endpoint's error, not only that every endpoint failed.
+        throw new RpcRequestError(e);
+      }
       return this.fallback.call(...args);
     }
   }
@@ -203,6 +240,11 @@ class MethodRoutingRpcTransport implements RpcCaller {
     this.defaultRpcCaller = defaultRpcCaller;
     this.routedMethodNames = new Set(routedMethodNames);
     this.routedRpcCaller = routedRpcCaller;
+  }
+
+  /** Names both callers, for the fallback warning that names a failed caller. */
+  toString(): string {
+    return `${this.defaultRpcCaller} (${[...this.routedMethodNames].join(', ')} via ${this.routedRpcCaller})`;
   }
 
   call(...args: Parameters<RpcTransport>): ReturnType<RpcTransport> {

@@ -2,6 +2,7 @@ import { Address, Rpc, SolanaRpcApi } from '@solana/kit';
 import { KaminoReserve, LedgerInstant } from '@kamino-finance/klend-sdk';
 import { Decimal } from 'decimal.js';
 import { TokenFlags } from '../utils/tokenFlags.js';
+import { ScopeOracleObservation } from './scopeOracleMonitor.js';
 
 /**
  * Result returned by a single trigger check for a single reserve.
@@ -23,6 +24,7 @@ export interface TriggerResult {
  * Context passed to each trigger check, providing shared on-chain state.
  */
 export interface TriggerContext {
+  scopeOracleObservations?: ReadonlyMap<Address, ScopeOracleObservation>;
   currentLedgerInstant: LedgerInstant;
   marketPrices: Map<Address, Decimal>; // mint -> market price (from off-chain price API)
   /**
@@ -32,11 +34,18 @@ export interface TriggerContext {
    */
   tokenFlags?: ReadonlyMap<Address, TokenFlags>;
   /**
-   * Stateful triggers stage, rather than commit, their observation when true. The coordinator uses
-   * this to commit a catastrophic observation only after its blacklist entry is durably persisted.
-   * Direct trigger callers retain the historical immediate-commit behavior when this is omitted.
+   * Present when the danger coordinator runs the pass. Stateful triggers then stage their observation
+   * under this pass generation instead of committing it, so the coordinator commits a catastrophic
+   * observation only after its blacklist entry is durably persisted, and a pass that outlived its
+   * watchdog cannot have its stale value committed by a newer pass. Absent for direct trigger callers,
+   * which commit immediately.
    */
-  deferObservationCommit?: boolean;
+  observationStaging?: { readonly generation: number };
+  /**
+   * Seconds a reserve's Scope price may go without an update before the stale-price trigger lowers its safety
+   * (MAX_STALE_PRICE_DURATION_SECONDS). Absent for direct trigger callers, which skip that check.
+   */
+  maxStalePriceDurationSeconds?: number;
 }
 
 /**
@@ -57,7 +66,7 @@ export interface DangerTrigger {
   ): Promise<TriggerResult>;
 
   /** Commit the most recently staged observation for this reserve, when the trigger is stateful. */
-  commitObservation?(reserveAddress: Address, reserve: KaminoReserve): void;
+  commitObservation?(reserveAddress: Address, reserve: KaminoReserve, generation: number): void;
 
   /**
    * Mints this trigger needs in `TriggerContext.marketPrices` beyond the universe's own reserve
@@ -66,6 +75,31 @@ export interface DangerTrigger {
    * extra price omits this.
    */
   priceReferenceMints?(reserveMints: Address[], tokenFlags?: ReadonlyMap<Address, TokenFlags>): Address[];
+}
+
+/** On-chain reserve state used by collateral checks. */
+export type CollateralReserve = Pick<KaminoReserve, 'state'>;
+
+/** A state-only trigger that can also check market collateral. */
+export interface CollateralTrigger {
+  readonly name: string;
+
+  check(
+    rpc: Rpc<SolanaRpcApi>,
+    reserveAddress: Address,
+    reserve: CollateralReserve,
+    context: TriggerContext
+  ): Promise<TriggerResult>;
+
+  commitObservation?(reserveAddress: Address, reserve: CollateralReserve, generation: number): void;
+}
+
+/** One pass's collateral trigger results for one lending market. */
+export interface MarketCollateralAssessment {
+  /** One result per collateral reserve and trigger that could check it. */
+  readonly results: readonly TriggerResult[];
+  /** The collateral reserves a trigger could not check. */
+  readonly unreadable: readonly Address[];
 }
 
 /**
@@ -154,9 +188,23 @@ export interface PendingEvacuationEntry extends BlacklistEntry {
 }
 
 /**
+ * Records a deposit freeze at the vault's holding. Recovery restores the original cap unless an operator changed it.
+ */
+export interface DepositFreezeEntry {
+  vault: string;
+  reserve: string;
+  /** The cap before the freeze, in vault-token lamports. */
+  originalCapLamports: string;
+  /** The cap the freeze set, the vault's holding at the time, in vault-token lamports. */
+  frozenCapLamports: string;
+  timestamp: string; // ISO 8601
+}
+
+/**
  * Schema of the danger_blacklist.json file.
  */
 export interface BlacklistFile {
   blacklistedReserves: BlacklistEntry[];
   pendingEvacuations: PendingEvacuationEntry[];
+  depositFreezes: DepositFreezeEntry[];
 }
