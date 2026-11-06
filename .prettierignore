@@ -1,0 +1,14 @@
+dist/
+docs/
+keys/
+node_modules/
+*.md
+**/idl_codegen
+src/idl.json
+test-ledger/
+tmp/
+helm/
+deps/
+.vscode/
+.idea/
+.clinic/

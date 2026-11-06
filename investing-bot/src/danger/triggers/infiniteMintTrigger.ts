@@ -1,9 +1,16 @@
 import { Address, Rpc, SolanaRpcApi } from '@solana/kit';
-import { KaminoReserve } from '@kamino-finance/klend-sdk';
 import { fetchMint } from '@solana-program/token-2022';
 import { Decimal } from 'decimal.js';
 import { logger } from 'kvaults-investing-bot-logger';
-import { DangerTrigger, DangerTriggerUnavailableError, TriggerContext, TriggerResult } from '../dangerTypes.js';
+import {
+  CollateralReserve,
+  CollateralTrigger,
+  DangerTrigger,
+  DangerTriggerUnavailableError,
+  TriggerContext,
+  TriggerResult,
+} from '../dangerTypes.js';
+import { StagedObservations } from '../observationStaging.js';
 import { RPC_REQUEST_TIMEOUT_MS, withTimeout } from '../../utils/timeout.js';
 
 const DEFAULT_SUPPLY_INCREASE_THRESHOLD_PERCENT = 50;
@@ -16,19 +23,31 @@ export type MintSupplyFetcher = (rpc: Rpc<SolanaRpcApi>, mint: Address) => Promi
 
 const defaultSupplyFetcher: MintSupplyFetcher = async (rpc, mint) => (await fetchMint(rpc, mint)).data.supply;
 
+/** Baselines expire after this interval. The next reading establishes a new baseline. */
+export const MAX_SUPPLY_BASELINE_AGE_SECONDS = 24n * 60n * 60n;
+
+/** A supply reading and the ledger time it was taken at. */
+interface SupplyBaseline {
+  supply: bigint;
+  observedAtSeconds: bigint;
+}
+
 /**
  * Catastrophic trigger: detects abnormal token supply growth (infinite mint attack).
  *
- * Tracks the supply of each underlying token mint across iterations.
+ * Tracks, for each reserve, the supply of its token mint across iterations. The baseline is per reserve, not per mint:
+ * the coordinator commits observations reserve by reserve, so a shared baseline would let one reserve's commit hide
+ * another reserve's unacted inflation.
  * If supply increases by more than the configured threshold between checks, it indicates
  * someone is minting tokens out of thin air.
  * Binary: below threshold → 1.0 (safe), above threshold → 0.0 (danger).
  */
-export class InfiniteMintTrigger implements DangerTrigger {
+export class InfiniteMintTrigger implements DangerTrigger, CollateralTrigger {
   readonly name = 'infinite-mint';
   private readonly thresholdPercent: number;
-  private readonly previousSupplyByMint: Map<string, bigint> = new Map();
-  private readonly pendingSupplyByMint: Map<string, bigint> = new Map();
+  private readonly previousSupplyByReserve: Map<string, SupplyBaseline> = new Map();
+  /** Staged per pass generation and reserve; see observationStaging.ts. */
+  private readonly pendingSupplyByReserve = new StagedObservations<SupplyBaseline>();
   private readonly fetchSupply: MintSupplyFetcher;
 
   constructor(
@@ -39,9 +58,10 @@ export class InfiniteMintTrigger implements DangerTrigger {
     this.fetchSupply = fetchSupply;
   }
 
-  async check(rpc: Rpc<SolanaRpcApi>, reserveAddress: Address, reserve: KaminoReserve, context: TriggerContext) {
+  async check(rpc: Rpc<SolanaRpcApi>, reserveAddress: Address, reserve: CollateralReserve, context: TriggerContext) {
     const mintAddress = reserve.state.liquidity.mintPubkey;
     const mintKey = mintAddress.toString();
+    const reserveKey = reserveAddress.toString();
 
     try {
       // Bound the on-chain read so one hung RPC can't stall the whole danger pass (defense in depth
@@ -52,18 +72,29 @@ export class InfiniteMintTrigger implements DangerTrigger {
         `[danger-detection] infinite-mint fetchMint ${mintKey}`
       );
 
-      const previousSupply = this.previousSupplyByMint.get(mintKey);
+      const observedAtSeconds = BigInt(context.currentLedgerInstant.blockTime);
+      const baseline = this.previousSupplyByReserve.get(reserveKey);
       const finish = (result: TriggerResult): TriggerResult => {
-        this.pendingSupplyByMint.set(mintKey, currentSupply);
-        if (!context.deferObservationCommit) {
-          this.commitObservation(reserveAddress, reserve);
+        const reading = { supply: currentSupply, observedAtSeconds };
+        const staging = context.observationStaging;
+        if (staging) {
+          this.pendingSupplyByReserve.stage(staging.generation, reserveKey, reading);
+        } else {
+          this.previousSupplyByReserve.set(reserveKey, reading);
         }
         return result;
       };
 
-      if (previousSupply === undefined) {
+      if (baseline === undefined) {
         return finish({ safetyScore: 1.0, triggerName: this.name, reserveAddress, details: 'first observation' });
       }
+      const baselineAgeSeconds = observedAtSeconds - baseline.observedAtSeconds;
+      if (baselineAgeSeconds > MAX_SUPPLY_BASELINE_AGE_SECONDS) {
+        const details = `baseline is ${baselineAgeSeconds}s old, above the ${MAX_SUPPLY_BASELINE_AGE_SECONDS}s limit; taking a new baseline`;
+        logger.warn(`[danger-detection] infinite-mint for reserve ${reserveKey}: ${details}`);
+        return finish({ safetyScore: 1.0, triggerName: this.name, reserveAddress, details });
+      }
+      const previousSupply = baseline.supply;
 
       if (previousSupply === 0n) {
         if (currentSupply > 0n) {
@@ -119,12 +150,11 @@ export class InfiniteMintTrigger implements DangerTrigger {
     }
   }
 
-  commitObservation(_reserveAddress: Address, reserve: KaminoReserve): void {
-    const mintKey = reserve.state.liquidity.mintPubkey.toString();
-    const pendingSupply = this.pendingSupplyByMint.get(mintKey);
+  commitObservation(reserveAddress: Address, _reserve: CollateralReserve, generation: number): void {
+    const reserveKey = reserveAddress.toString();
+    const pendingSupply = this.pendingSupplyByReserve.take(generation, reserveKey);
     if (pendingSupply !== undefined) {
-      this.previousSupplyByMint.set(mintKey, pendingSupply);
-      this.pendingSupplyByMint.delete(mintKey);
+      this.previousSupplyByReserve.set(reserveKey, pendingSupply);
     }
   }
 }

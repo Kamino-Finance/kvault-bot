@@ -1,343 +1,424 @@
 # kvault-bot
 
-An off-chain bot that keeps [Kamino Earn lending vaults](https://kamino.com/earn/lend) invested and
-rebalances their reserve allocations according to a configured strategy, with a danger-detection layer
-that pulls funds out of a reserve that starts misbehaving.
+This bot invests Kamino Earn lending vaults and changes their reserve allocation weights.
+Its allocation loop checks reserve and market collateral danger before each pass.
 
-Source: [github.com/Kamino-Finance/kvault](https://github.com/Kamino-Finance/kvault).
-Field-by-field config and environment reference: [`docs/configuration.md`](./docs/configuration.md).
+| Loop       | Flag                        | Signer                         | Action                                                                                  |
+| ---------- | --------------------------- | ------------------------------ | --------------------------------------------------------------------------------------- |
+| Invest     | `INVEST_LOOP`               | `INVESTOR_SECRET_PATH`         | Runs permissionless invest instructions using the vault's on-chain weights.             |
+| Allocation | `ALLOCATION_REBALANCE_LOOP` | `ALLOCATION_ADMIN_SECRET_PATH` | Checks danger, updates weights, applies deposit freezes, and invests configured vaults. |
 
-It runs two independent loops, each switchable:
+The loops have separate switches. Danger detection runs only with the allocation loop.
+The invest loop alone does not detect new danger.
 
-| Loop | Env flag | Signer | What it does |
-| --- | --- | --- | --- |
-| Invest | `INVEST_LOOP` | `INVESTOR_SECRET_PATH` | Cranks the permissionless `invest` instruction so each vault's actual token placement matches its on-chain allocation weights. |
-| Allocation rebalance | `ALLOCATION_REBALANCE_LOOP` | `ALLOCATION_ADMIN_SECRET_PATH` | Runs danger detection, computes new allocation weights per strategy, writes them on-chain, then invests. Must sign as each vault's `allocation_admin`. |
+## Prerequisites
 
-## Which key to run it on
+Use Node.js with Yarn Classic `1.22.22`, as specified by `packageManager`.
+The source deployment uses Node.js `26.12.1`.
+Install development dependencies for the TypeScript build and the source-based start command.
 
-The invest loop is permissionless: any funded keypair can run it.
+Supply a Solana RPC endpoint for the selected cluster.
+The allocation loop also needs access to KSwap market prices and the Kamino token-flags feed.
+Managed lookup tables use `https://api.kamino.finance/luts/managed`.
+Use the program addresses for your deployment. Changing `CLUSTER` does not change these addresses.
 
-The allocation loop signs allocation updates and emergency pull-outs, so its keypair should be the
-on-chain `vault.allocation_admin` of every configured vault. That role is distinct from
-`vault_admin_authority`: you can delegate it without handing over vault administration, and it is the
-only authority the bot needs at runtime. The vault admin is needed once per reserve, up front, to add
-that reserve to the allocation, because the bot updates allocations but never creates them.
+Both signers need SOL for transaction fees and account creation.
+The invest signer also needs SOL for token buffers that the bot funds through KSwap or SOL wrapping.
+Keypair files must contain a JSON array of 64 secret-key bytes.
 
-The program also accepts `vault_admin_authority` here, so an admin key works. **Don't.** That puts full
-vault administration (fees, whitelists, authority changes) behind a long-lived key on a server, for
-zero extra capability. Use `allocation_admin` and keep the admin key offline.
+## Authority
+
+Use each configured vault's `allocation_admin` for the allocation loop.
+The vault admin can also sign, but grants broader authority than the bot needs.
+Keep the vault admin key separate from the bot's runtime key.
+
+Before operation, use the vault admin to add every reserve that the strategy can use.
+The bot updates existing allocation entries. It does not add new reserves.
+Check the vault's reserve whitelists, caps, minimum amounts, and invest delays before operation.
+The program can reject a transaction even when the bot's off-chain checks pass.
 
 ## Quick start
 
-```bash
-# 1. clone, install and build (tx/ and logger/ are consumed from dist/, so build is required)
-git clone https://github.com/Kamino-Finance/kvault.git && cd kvault
-yarn && yarn build
+Run these commands from this repository's root directory.
+Use the repository URL that contains this checkout.
 
-# 2. create a profile file in the repo root
-cp .env.example .env.mainnet-beta        # then edit: RPC, loop flags, key paths
+1. Install dependencies and compile the three workspaces.
 
-# 3. create the runtime config files (use absolute paths)
-cp allocation_config_example.json allocation_config.json
-yarn cli danger init --path "$PWD/danger_blacklist.json"
+   ```bash
+   yarn install --frozen-lockfile --production=false
+   yarn build
+   ```
 
-# 4. run
-PROFILE=mainnet-beta yarn start
-```
+2. Create a profile and allocation file.
 
-The profile file is loaded from the repo root as `.env.<PROFILE>`. `PROFILE` defaults to `CLUSTER`,
-which defaults to `mainnet-beta`, so with nothing set the bot loads `.env.mainnet-beta`. Values missing
-from the file fall through to real environment variables, so containers can skip the file entirely.
-`${VAR}` references inside it are expanded.
+   ```bash
+   cp .env.example .env.mainnet-beta
+   cp allocation_config_example.json allocation_config.json
+   ```
 
-| Command | Purpose |
+   Edit both files before operation. Replace the allocation example's vault and reserve addresses.
+   Remove example entries that you do not use. Address validation does not confirm that a vault exists or belongs to your deployment.
+   Set `RPC_ENDPOINT` to your HTTP(S) RPC URL.
+   Set absolute paths for `ALLOCATION_CONFIG_PATH`, `DANGER_BLACKLIST_PATH`, and the keypair files.
+   Check the loop flags. The example enables the invest loop and the public UI vault list.
+
+3. Create the safety file in its persistent directory.
+
+   ```bash
+   yarn cli danger init --path "$PWD/danger_blacklist.json"
+   ```
+
+   Use this absolute path as `DANGER_BLACKLIST_PATH` for both loops.
+   For production, place the file on persistent storage and set `NODE_ENV=production`.
+   Create its parent directory before startup.
+
+4. Start allocation observation with the invest loop disabled.
+
+   ```bash
+   PROFILE=mainnet-beta INVEST_LOOP=false ALLOCATION_REBALANCE_LOOP=true ALLOCATION_DRY_RUN=true yarn start
+   ```
+
+   This command needs the allocation admin keypair, a valid allocation config, and network access.
+   Check the logs for the intended vault set, strategy, exclusions, and target weights.
+   `ALLOCATION_DRY_RUN` affects only the allocation loop. The invest loop can still send transactions when enabled.
+
+5. After the checks, set the intended loop flags and dry-run values in the profile.
+
+   ```bash
+   PROFILE=mainnet-beta yarn start
+   ```
+
+   The allocation loop invests after each successful due rebalance, including when weights do not change.
+   An allocation-only deployment does not require the independent invest loop.
+
+No option provides a dry-run for the independent invest loop.
+`yarn dry-run` selects `.env.local` and sets allocation dry-run only.
+It can send invest transactions if that profile enables `INVEST_LOOP`.
+
+## Profiles and paths
+
+`yarn start` and `yarn cli` run from `investing-bot/`.
+Relative config paths and CLI `--path` values resolve from that directory.
+Use absolute paths in deployments.
+Keypair loading also checks the parent directory as a fallback.
+
+For `yarn start`, shell-level `PROFILE` selects `../.env.<PROFILE>`.
+When `PROFILE` is absent, shell-level `CLUSTER` selects the profile. The default is `mainnet-beta`.
+Existing process environment values take precedence over profile values.
+The loader expands `${VAR}` references. A missing profile uses the process environment.
+
+The CLI does not load profile files.
+Pass `--path` explicitly, or export `DANGER_BLACKLIST_PATH` in the shell before each danger command.
+Set `NODE_OPTIONS` in the shell. Node reads it before the profile loads.
+
+## Commands
+
+| Command                                                            | Purpose                                                             |
+| ------------------------------------------------------------------ | ------------------------------------------------------------------- |
+| `yarn build`                                                       | Compiles `investing-bot`, `tx`, and `logger`.                       |
+| `yarn start`                                                       | Runs bot sources through ts-node. Build `tx` and `logger` first.    |
+| `yarn cli print-rebalance-strategies`                              | Lists the registered strategies without starting the bot.           |
+| `yarn cli danger list --path /absolute/path/danger_blacklist.json` | Prints blacklists, pending evacuations, and deposit freeze records. |
+| `yarn config:generate` / `yarn config:check`                       | Generates or checks `.env.example` and the marked README tables.    |
+
+This repository contains source, package manifests, the lockfile, example files, and lint configuration.
+Tests, CI configuration, validator fixtures, and deployment files are not included.
+The test, localnet, and validator scripts require these additional files.
+Use `yarn lint`, `yarn build`, and `yarn config:check` for local checks.
+
+## Invest behavior
+
+The vault set combines explicit `INVEST_VAULTS`, vaults from `INVEST_OWNERS`, and the optional public UI list.
+With all three selectors empty, the bot selects every on-chain vault.
+Set explicit selectors before a live run.
+
+Each pass creates missing token accounts and funds small token buffers for rounding costs.
+Funding swaps require fresh reference prices and satisfy both route and reference-price slippage limits.
+A vault must pass the configured token movement threshold and the off-chain and on-chain invest delays.
+`MIN_INVEST_TOKENS` uses whole tokens and compares the larger of projected deposits and withdrawals.
+`INVEST_MIN_SLOT_BYPASS_VAULTS` bypasses only the configured off-chain delay.
+
+The invest loop skips vaults with pending evacuations or blacklisted exposure.
+In the same process, it also blocks deposits into the allocation loop's excluded reserves.
+Reserve instructions that fail with an attributable program error enter an in-memory cooldown.
+Other reserves can continue when the failed instruction can be isolated safely.
+
+Separate investing processes must read the same safety file.
+They must also use the same `ALLOCATION_CONFIG_PATH` to enforce enabled utilization limits before normal invests.
+Restart the allocation loop after allocation config changes. The independent invest loop rereads that file before normal invests.
+
+## Rebalance behavior
+
+Each allocation pass checks danger for all configured vaults before normal rebalances.
+It waits no longer than `DANGER_PASS_INTERVAL_SECONDS` between passes, subject to shorter configured frequencies and manager refreshes.
+The pass duration adds to this gap. Each vault retains its own rebalance frequency, including in dry-run.
+A restart resets the rebalance schedule and in-memory observations.
+
+All normal weight updates for one vault use one atomic transaction.
+If they exceed the Solana transaction size limit, the bot sends none and skips that vault's invest.
+After confirmed updates, the bot waits five seconds, reloads state, and invests.
+A failed allocation send does not authorize a normal invest.
+
+Strategies use healthy reserves. Blacklisted reserves receive zero weight.
+Reserves excluded from new funds retain their weights and receive no deposits.
+The bot can temporarily lower token caps to enforce these deposit freezes, then restore the recorded caps after recovery.
+It preserves cToken caps. See [configuration details](docs/configuration.md) for weight, capacity, and drift behavior.
+
+## Danger detection
+
+Each trigger returns a safety score between zero and one. Scores multiply.
+A reserve triggers evacuation when its combined score is strictly below the vault entry's risk threshold.
+Thresholds are `0.5` for `PARANOID`, `0.3` for `SENSIBLE`, and `0.1` for `YOLO`.
+
+The checks include mint supply, exchange rate, yield, liquidity, oracle divergence, Scope freshness, depeg, utilization, and depositor dominance.
+Market collateral also contributes infinite-mint and stale or zero Scope price checks.
+The [danger catalog](investing-bot/src/danger/danger_triggers_catalog.md) defines the scoring curves, exclusions, responses, and limits.
+
+Emergency responses zero the dangerous weights and attempt withdrawals.
+They can broadcast despite failed simulation. After three consecutive attributable failed broadcasts for a vault and reserve,
+that reserve must pass simulation before another forced broadcast. Restarting clears this fee limit.
+A failed or timed-out danger pass skips normal allocation work. Repeated danger failures also make readiness fail.
+
+## Safety state and recovery
+
+`DANGER_BLACKLIST_PATH` stores permanent blacklists, pending evacuations, and original caps for deposit freezes.
+Use the same persistent file for both loops and operator commands.
+The store uses locked updates and atomic file replacement.
+A missing or whitespace-only file means empty safety state. Corrupt state or a missing parent directory causes an error.
+Do not replace a live safety file with an empty template.
+
+Catastrophic events create permanent reserve blacklists.
+Transient danger starts a reinvest cooldown, which defaults to 2,700 seconds.
+Cooldowns, trigger baselines, zero-price clocks, and failure counters reside in memory and reset on process restart.
+Pending evacuations persist until the vault holds no weight and no tokens in the affected reserve.
+Deposit freeze records persist until recovery restores the cap, unless an operator changed the cap.
+
+1. Inspect the file with `yarn cli danger list --path /absolute/path/danger_blacklist.json`.
+2. Check the cause, current exposure, on-chain weights, caps, and failed transaction logs.
+3. Correct the underlying problem before removing a permanent blacklist entry.
+
+   ```bash
+   yarn cli danger clear-reserve <reserveAddress> --path /absolute/path/danger_blacklist.json
+   ```
+
+The clear command sends no transaction. It removes only the permanent blacklist entry.
+It preserves pending evacuations and deposit freeze records.
+`clear-all` removes every permanent blacklist entry and has the same limits.
+Do not delete freeze records as a recovery method. They hold the cap values needed for restoration.
+
+## Process health
+
+With `SERVER=true`, the default health server uses port `8080` and exposes `/health`, `/live`, and `/ready`.
+Readiness requires enabled-loop heartbeats and successful danger monitoring.
+Use `/ready` for the deployment readiness probe.
+
+The allocation loop runs in a supervised worker with a 4 GB old-generation heap limit.
+Worker restart attempts are limited. A permanently unhealthy worker needs a process restart.
+`SIGINT` and `SIGTERM` request shutdown, stop the worker, and then stop the health server.
+A hard exit follows after 20 seconds if shutdown does not finish.
+Production logs use JSON. `LOG_LEVEL` controls their level, and `VERBOSE=true` adds allocation detail.
+
+## Lookup tables
+
+The bot combines the vault's on-chain lookup table with managed tables from the Kamino API.
+Managed API or managed-account read failures retain the available on-chain table.
+An on-chain table read failure fails the vault operation.
+
+After a send fails, the bot checks table metadata for deactivation.
+Verified deactivating tables are excluded for later attempts, and managed addresses are refreshed.
+This recovery does not resend the failed transaction. An unknown transaction outcome can still need operator investigation.
+
+## Strategies
+
+The strategy registry generates this table.
+Detailed constraints and drift behavior are in [configuration details](docs/configuration.md#strategies).
+
+<!-- prettier-ignore-start -->
+
+<!-- strategies:start -->
+| Strategy | What it does |
 | --- | --- |
-| `yarn build` | Compiles all three workspaces (`tsc --build`). |
-| `yarn start` | Runs the bot. `investing-bot` sources run through ts-node. `tx/` and `logger/` are consumed from `dist/`, so changes there need a rebuild; changes under `investing-bot/src/` only need a restart. |
-| `yarn dry-run` | `yarn start` with `PROFILE=local ALLOCATION_DRY_RUN=true`. |
-| `yarn cli danger …` | Blacklist management. |
-| `yarn cli print-rebalance-strategies` | Prints the valid strategy names. |
+| `EQUAL` | Equal weight to every reserve. |
+| `MAX_YIELD` | Coarse-to-fine grid search over the full allocation space to maximize vault APY; applies the optimum immediately. |
+| `MAX_YIELD_STABLE` | Minimizes the spread between simulated reserve yields. APY is reported, but is not currently a tie-breaker in the optimizer. |
+| `MAX_YIELD_WITH_FIXED_RESERVES` | `MAX_YIELD` with a minimum combined search allocation (`reservesAllocationPercentageBPS`) across a named set of reserves (`fixedReserves`); emitted weights remain subject to runtime deposit and withdrawal constraints. |
+| `MAX_YIELD_DRIPPING` | Computes the `MAX_YIELD` target — optionally utilization-bounded (opt-in, see `enforceUtilizationCap`) — and moves a configurable fraction of the current-to-target gap per iteration (`drippingRatePercent`, default 20%) before applying runtime constraints. See the exact behavior below. |
+| `FIXED_WEIGHTS` | Explicit per-reserve weights from config (`fixedReserves` given as `{ reserve, weight }` objects), read as shares: the bot writes them on the vault's current weight total, so the share the vault leaves unallocated stays. `fixedReserves` must list every healthy reserve of the vault. When one is missing, the bot logs an error and keeps the vault's current weights; it still zeroes blacklisted reserves. |
+| `RANDOM` | Random weights — testing/experimentation only. |
+| `UNCHANGED` | No-op; recomputes the current APY without changing the allocation. |
+<!-- strategies:end -->
 
-The repo is three workspaces plus three example files:
+<!-- prettier-ignore-end -->
 
-```
-investing-bot/     the bot: loops, strategies, danger detection, CLI
-tx/                transaction building, sending, RPC pool, priority fees
-logger/            structured logging
-.env.example                        config template  →  copy to .env.<PROFILE>
-allocation_config_example.json      strategy config  →  copy, point ALLOCATION_CONFIG_PATH at it
-danger_blacklist_example.json       blacklist format →  DANGER_BLACKLIST_PATH file
-```
+## Allocation fields
 
-See [`danger_triggers_catalog.md`](./investing-bot/src/danger/danger_triggers_catalog.md) for the
-authoritative risk, measurement, scoring curve and thresholds of each implemented and planned trigger.
+The file at `ALLOCATION_CONFIG_PATH` contains `{ "allocationsConfig": [ ... ] }`.
+Each entry assigns a strategy to vault strings or vault objects.
+The registry generates these field tables. Defaults apply when a field is absent.
 
-## What will bite you
+<!-- prettier-ignore-start -->
 
-Read this section before the first live run. Everything here fails quietly or costs money, and none of
-it is guessable from the config schema.
+<!-- allocation-fields:start -->
+**Entry fields**
 
-**Every address and number in this repo is an example.** The vault and reserve addresses, strategies,
-thresholds and tuning values in the example files, and any hardcoded address in the source, are
-illustrative placeholders showing the shape of a valid config. Nothing here is the configuration anyone
-runs. Replace all of it.
+| Field | Required | Default | Applies to | Meaning |
+| --- | --- | --- | --- | --- |
+| `strategy` | yes | — | all | One of the strategies above; applied to every vault in the entry. |
+| `vaults` | yes | — | all | Array of vault address strings, and/or objects for per-vault settings (see below). An entry with an empty array is ignored, with a warning. |
+| `rebalanceFrequencySeconds` | no | `3600` | all | Minimum seconds between rebalances. Set at the entry level, it applies to all vaults in the entry (overriding per-vault values). |
+| `includeReservesSupplyFarmRewardsApy` | no | `true` | all | Include farm-reward APY in the yield computation. |
+| `allocationDryRun` | no | `false` | all | Compute and log without sending transactions. This value applies to string vault entries. Object vault entries use their own `allocationDryRun` value. The global `ALLOCATION_DRY_RUN=true` forces dry-run for every vault. |
+| `riskAppetiteMode` | no | `SENSIBLE` | all | Danger-detection sensitivity for all vaults in the entry: `PARANOID`, `SENSIBLE`, or `YOLO` — see [Danger detection](#danger-detection). An invalid value fails config loading. |
 
-**Relative paths resolve against `investing-bot/`, not the repo root, and the failure is silent.** Both
-`yarn start` and `yarn cli` run inside that workspace, in the profile file and in a CLI `--path` alike.
-That is why `.env.example` writes `../allocation_config.json` and `../danger_blacklist.json`, since
-`../` *is* the repo root. A `./danger_blacklist.json` passed to the CLI lands in `investing-bot/`, where
-the bot never looks. Only keypair paths are forgiving, because `readSecret` tries the path as given,
-then relative to the working directory, then the workspace root. `ALLOCATION_CONFIG_PATH`,
-`DANGER_BLACKLIST_PATH` and `--path` go straight to `fs`, so a wrong path means no file, and for the
-blacklist an empty blacklist that silently enforces nothing. **Use absolute paths in any real
-deployment.**
+**Entry or vault-object fields** (set on the entry or on a vault object; the vault value wins)
 
-**Pre-add every reserve with the vault admin key.** The bot only updates allocations already in the
-vault's `vault_allocation_strategy` and skips the rest, because the program lets `allocation_admin`
-update an existing allocation but requires `vault_admin_authority` to insert one
-(`WrongAdminOrAllocationAdmin`). Add every reserve the bot may allocate to before you start it;
-afterwards it needs nothing but `allocation_admin`.
+| Field | Required | Default | Applies to | Meaning |
+| --- | --- | --- | --- | --- |
+| `driftRatePercent` | no | — | `EQUAL`, `MAX_YIELD`, `MAX_YIELD_STABLE`, `MAX_YIELD_WITH_FIXED_RESERVES`, `FIXED_WEIGHTS`, `RANDOM` | Percent of the current→target gap closed per iteration; unset applies the target at once. Must be in `(0, 100]`. `MAX_YIELD_DRIPPING` rejects it and uses `drippingRatePercent`. That rejection also fails loading when an entry sets the rate and one of its vault objects overrides the strategy to `MAX_YIELD_DRIPPING`. Set the rate on the other vault objects instead. |
+| `drippingRatePercent` | no | `20` | `MAX_YIELD_DRIPPING` | Percent of the current→target gap closed per iteration. With the utilization cap enabled, movement starts from actual token holdings. Otherwise it starts from configured weights. Must be in `(0, 100]`. |
+| `enforceUtilizationCap` | no | `false` | `MAX_YIELD_DRIPPING` | Whether to bound the target by the per-reserve utilization cap. Set `true` to opt into utilization-bounded targets. |
+| `maxUtilizationChangeBps` | no | `100` (1%) | `MAX_YIELD_DRIPPING` | The per-iteration utilization-change cap in basis points when enforced. Must be in `(0, 10000]`; to disable the cap use `enforceUtilizationCap: false`, not `0`. |
+| `maxVaultDominanceBps` | no | — | all | Danger detection: the vault's share of a reserve's total supply, in basis points, at or above which the dominant-depositor trigger forces a pull-out at any risk appetite. Unset keeps the graduated score only. Must be in `(0, 10000]`. |
 
-**Put the blacklist on a persistent volume.** The blacklist and the pending evacuations live in
-`DANGER_BLACKLIST_PATH` and must survive restarts. Losing the file re-admits reserves the bot decided
-were permanently compromised. With `NODE_ENV=production` the bot refuses to start unless the path is
-set explicitly, since the default is container-ephemeral.
+**Vault-object fields** (use an object instead of a plain address string when a vault needs fixed reserves or its own overrides)
 
-**Re-check `unallocated_weight` whenever you change a vault's strategy.** Weights are absolute and the
-total differs by strategy: `EQUAL` writes 100,000 per reserve (300,000 total on a three-reserve vault),
-`FIXED_WEIGHTS` writes exactly what the config says, and the max-yield family preserves the vault's
-existing total. At `unallocated_weight = 0` only ratios matter, so this is invisible; at nonzero it is
-not, because the same ratios at a 3× larger total shrink the uninvested share to roughly a third. No
-config field expresses this coupling.
+| Field | Default | Applies to | Meaning |
+| --- | --- | --- | --- |
+| `vault` | — | all | The vault address. |
+| `strategy` | entry value | all | Optional strategy override for this vault; otherwise the entry-level strategy applies. |
+| `fixedReserves` | — | `MAX_YIELD_STABLE`, `MAX_YIELD_WITH_FIXED_RESERVES`, `FIXED_WEIGHTS` | Reserve address strings — the reserves the search-allocation floor applies to (`MAX_YIELD_WITH_FIXED_RESERVES`, `MAX_YIELD_STABLE`); or `{ reserve, weight }` objects for `FIXED_WEIGHTS`. |
+| `reservesAllocationPercentageBPS` | — | `MAX_YIELD_STABLE`, `MAX_YIELD_WITH_FIXED_RESERVES` | Minimum combined allocation, in basis points, for `fixedReserves`; must be in `[0, 10000]`. |
+| `fixedReservesStrategy` | `EQUAL` | all | Metadata only; the fixed-reserve strategies use the explicit floor/weights described above. Must be a known strategy. |
+| `includeReservesSupplyFarmRewardsApy` | entry value | all | Optional farm-reward APY override for this vault. |
+| `allocationDryRun` | `false` | all | Dry-run setting for this object vault, overriding the entry-level value. `ALLOCATION_DRY_RUN=true` still forces dry-run globally. |
+| `rebalanceFrequencySeconds` | `3600` | all | Per-vault frequency used only when the entry-level field is omitted; the entry-level value wins. |
+<!-- allocation-fields:end -->
 
-**`EQUAL`, `RANDOM` and `FIXED_WEIGHTS` are cap-unaware.** They emit weights verbatim with no bound
-projection, so nothing stops them asking for more than a reserve can absorb or less than it can
-release. The weights are written successfully and the mismatch surfaces later at the invest crank,
-which under-fills or fails for that reserve. Worth knowing before pointing `FIXED_WEIGHTS` at a thin
-reserve.
+<!-- prettier-ignore-end -->
 
-**Start in dry-run.** `ALLOCATION_DRY_RUN=true` for the first passes computes and logs everything and
-sends nothing. Danger detection still evaluates and logs; no transaction is ever sent for a dry-run
-vault.
+## Environment settings
 
-Two more, on operating the thing: never commit secrets, since `.env.*` profiles hold RPC and KSwap API
-keys and keypair files hold signing authority. And watch `/ready`, because a wedged loop shows up there
-before it shows up in the logs.
+The registry generates these tables and `.env.example`.
+The tables show code defaults. The example profile overrides some defaults and enables live investing.
 
-## Process model
+<!-- prettier-ignore-start -->
 
-A health server starts before the loops when `SERVER=true` (default) on `SERVER_PORT` (default `8080`),
-via [lightship](https://github.com/gajus/lightship), exposing `/health`, `/live` and `/ready`.
-Readiness is driven by loop heartbeats: if any enabled loop goes silent for
-`LOOP_HEARTBEAT_TIMEOUT_MS` (default `3 × RPC_REQUEST_TIMEOUT_MS`), the process reports not ready.
-Point your orchestrator's readiness probe at `/ready` to catch a wedged loop.
+<!-- settings:start -->
+**RPC**
 
-The invest loop runs in the main thread's async context. The allocation loop runs in a worker thread
-with a 4 GB heap cap, restarted up to 3 times on unexpected exit, with the counter resetting on any
-heartbeat. After 3 failed restarts the loop is marked permanently unhealthy: readiness goes false and
-the process needs an external restart. Both loops are wrapped in a retry harness, so a thrown error
-inside a pass is logged and the loop re-enters rather than killing the process.
+| Setting | Default | Used by | Description |
+| --- | --- | --- | --- |
+| `RPC_ENDPOINT` | — | invest, allocation, danger | Legacy mode: the primary RPC URL. Legacy mode needs at least one of RPC_ENDPOINT, RPC_ENDPOINTS or RPC_ENDPOINT_\*. |
+| `WS_ENDPOINT` | — | invest, allocation | WebSocket RPC URL. When unset or blank, the bot derives it from the read RPC URL (https -&gt; wss). |
+| `RPC_ENDPOINTS` | `[]` | invest, allocation, danger | Legacy mode: fallback RPCs as a JSON array of { url, dedicatedWriteUrl?, name?, feePercentileSupportOverride? } objects. |
+| `RPC_ENDPOINT_*` | — | invest, allocation, danger | Legacy mode: one fallback RPC URL per variable, ordered by suffix. A suffix that contains FEES_TRITON_STYLE, FEES_HELIUS_STYLE or FEES_NONE sets the fee API support. |
+| `USE_RPC_CONFIG_FILE` | `false` | invest, allocation, danger | Use indexed mode (RPC_READ_&lt;n&gt;, RPC_SEND_&lt;n&gt;, RPC_PRIORITY_FEE_&lt;n&gt;_TRITON/HELIUS) instead of the legacy RPC settings. |
+| `RPC_READ_*` | — | invest, allocation, danger | Indexed mode: read RPC URLs as RPC_READ_&lt;n&gt;, in numeric fallback order. At least one is required when USE_RPC_CONFIG_FILE=true. |
+| `RPC_SEND_*` | — | invest, allocation, danger | Indexed mode: optional write RPC URL as RPC_SEND_&lt;n&gt;, paired with RPC_READ_&lt;n&gt;. |
+| `RPC_PRIORITY_FEE_*` | — | invest, allocation, danger | Indexed mode: RPC URLs with a priority fee API, as RPC_PRIORITY_FEE_&lt;n&gt;_TRITON or RPC_PRIORITY_FEE_&lt;n&gt;_HELIUS. |
+| `RPC_MULTICAST_ENDPOINTS` | `[]` | tx | Extra endpoints that also receive every sent transaction, as a JSON array of { name, connection } objects. |
+| `RPC_MULTICAST_ENDPOINT_*` | — | tx | One multicast endpoint URL per variable, named after the suffix in kebab case (RPC_MULTICAST_ENDPOINT_IRONFORGE -&gt; ironforge). |
+| `RPC_REQUEST_TIMEOUT_MS` | `120000` | process, invest, allocation, danger, tx | Timeout in milliseconds for one RPC request. Must be a positive safe integer. |
+| `EXTERNAL_REQUEST_TIMEOUT_MS` | `30000` | invest, allocation, danger, tx | Timeout in milliseconds for one HTTP request to an external API, such as KSwap or the token flags feed. Must be a positive safe integer. |
 
-On `SIGINT`/`SIGTERM` the bot stops the health server, signals the worker, waits 5 s for it to finish,
-then force-terminates; a hard exit follows after 10 s. The timezone is forced to UTC. Logs are JSON in
-production (`NODE_ENV=production`) and colorized otherwise, with verbosity via `LOG_LEVEL` (default
-`info`) plus `VERBOSE=true` for per-allocation detail.
+**Transactions**
 
-## How the invest loop works
+| Setting | Default | Used by | Description |
+| --- | --- | --- | --- |
+| `SIMULATE` | `true` | tx | Simulate transactions to find the approximate CU consumed before sending. |
+| `SPAM` | `false` | tx | Send the same transaction multiple times. |
+| `MULTICAST_JITO` | `false` | tx | Multicast transactions to Jito validators with a tip instruction. |
+| `PRIORITY_FEE_PERCENTILE` | `50` | tx | Priority fee percentile: a number in [0, 100], true (the 50th percentile) or false (disabled). Needs an RPC with a percentile fee API. |
+| `PRIORITY_MICRO_LAMPORTS_PER_CU_DEFAULT` | `5000` | tx | Fallback priority fee in micro-lamports per CU. Must be between the MIN and MAX bounds. |
+| `PRIORITY_MICRO_LAMPORTS_PER_CU_MIN` | `1` | tx | Lower bound of the priority fee in micro-lamports per CU. |
+| `PRIORITY_MICRO_LAMPORTS_PER_CU_MAX` | `4000000` | tx | Upper bound of the priority fee in micro-lamports per CU. |
 
-Every `LOOP_INTERVAL_MS` the loop resolves its vault set, tops up crank funds, then decides per vault
-whether to send an invest crank.
+**Modes**
 
-The vault set is the union of `INVEST_VAULTS` (explicit pubkeys), all vaults owned by `INVEST_OWNERS`,
-and, when `INVEST_UI_VAULTS=true`, every vault in Kamino's public resources feed. With none of the three
-set, it invests **every** vault on-chain. The set is re-resolved every pass, so a new vault under a
-configured owner is picked up automatically.
+| Setting | Default | Used by | Description |
+| --- | --- | --- | --- |
+| `INVEST_LOOP` | `false` | process | Run the invest loop. |
+| `ALLOCATION_REBALANCE_LOOP` | `false` | process | Run the allocation-rebalance loop, which includes danger detection, in a worker thread. |
 
-Crank funding exists because the `invest` instruction reconciles cToken↔liquidity rounding with a
-top-up of at most a few base units, drawn first from the vault's own `available_crank_funds`, then from
-the crank payer's token account. So the signer needs a token account per vault mint with a small
-balance; the bot keeps 10 base units per vault holding that mint as the buffer. Missing amounts come
-from a KSwap exact-out swap from WSOL, or a plain SOL wrap when the vault token *is* WSOL, with missing
-ATAs created first. Each swap is guarded twice over, by `DEFAULT_SWAP_SLIPPAGE_BPS` on the route itself
-and by an independent reference-price bound (`DEFAULT_PRICE_SLIPPAGE_BPS`) against fresh KSwap prices,
-plus pre/post balance assertions. If reference prices are missing or older than
-`MARKET_PRICE_MAX_AGE_SECONDS` the funding swap is skipped rather than executed blind, and the pass
-continues with existing balances.
+**Wallet**
 
-A vault is cranked only when both an amount and a time condition hold. The amount condition is that the
-summed positive gap between the vault's target allocation (derived from on-chain weights) and its
-current per-reserve holdings exceeds `MIN_INVEST_TOKENS`; only positive gaps count, so a pure reshuffle
-is not double-counted, and when a vault has no reserves or all weights are zero the whole invested
-balance counts as the gap. The time condition is that at least `MIN_SECONDS_SINCE_LAST_INVEST` worth of
-slots have passed since the vault's most recent `last_invest_slot` across all its reserves, and that the
-vault's on-chain `min_invest_delay_slots` has elapsed.
+| Setting | Default | Used by | Description |
+| --- | --- | --- | --- |
+| `INVESTOR_SECRET_PATH` | `/run/secrets/investor_keypair` | invest | Keypair file that signs the permissionless invest transactions. Any keypair with some SOL can do this. |
+| `ALLOCATION_ADMIN_SECRET_PATH` | `/run/secrets/allocation_admin` | allocation | Keypair file of the vaults allocation admin, which signs allocation updates. |
 
-One vault address is hardcoded to bypass the `MIN_SECONDS_SINCE_LAST_INVEST` check:
-`CONFIG_MIN_SLOT_BYPASS_VAULT` in `investing_loop.ts`, currently
-`4TwKA9JXEGeLEpAPLoarhSQoQwoiu12dkDCjSuVvHQUf`. That is an example value, not a vault this bot is run
-against, and it only has an effect if that address is in your invest set.
+**Invest**
 
-Both checks are off-chain heuristics layered on the program's own gates, which are stricter in two ways:
-the delay is enforced per reserve (`last_invest_slot + min_invest_delay_slots`, else `InvestTooSoon`),
-and each move must exceed the vault's `min_invest_amount`, else `InvestAmountBelowMinimum`. The one
-exemption is an uncapped full evacuation of a `weight == 0` reserve, always allowed to go to zero, so a
-danger pull-out is never blocked by the minimum-amount floor.
+| Setting | Default | Used by | Description |
+| --- | --- | --- | --- |
+| `INVEST_VAULTS` | (empty) | invest | Vault addresses to invest, separated by commas or whitespace. An address that holds no vault is skipped and logged. With INVEST_VAULTS, INVEST_OWNERS and the UI list all empty, every vault on chain is invested. |
+| `INVEST_OWNERS` | (empty) | invest | Vault owner addresses, separated by commas or whitespace. The vaults of these owners are invested too. |
+| `INVEST_UI_VAULTS` | `false` | invest | Also invest the vaults that the Kamino UI lists. |
+| `INVEST_MIN_SLOT_BYPASS_VAULTS` | (empty) | invest | Vaults exempt from the MIN_SECONDS_SINCE_LAST_INVEST gate, separated by commas or whitespace. |
 
-A vault is skipped when a withdrawal it needs exceeds the source reserve's available liquidity and there
-is not enough idle balance to make the move worthwhile, since cranking would just fail on-chain. It is
-also skipped when the danger layer has unfinished business with it: the loop reads the blacklist file,
-both its blacklisted reserves and its per-vault pending evacuations, and refuses to invest a vault still
-holding exposure to a blacklisted reserve or with an evacuation in flight, since investing there would
-push funds back into a reserve the bot is trying to leave.
+**Allocation rebalance**
 
-Instructions are sent in batches of 2 (invest) or 4 (ATA creation), preserving SDK order so disinvests
-land before the matching invests.
+| Setting | Default | Used by | Description |
+| --- | --- | --- | --- |
+| `ALLOCATION_CONFIG_PATH` | (empty) | allocation, invest | Path to the allocation config JSON file. Set it when the allocation-rebalance loop runs. Separate investing processes must use the same file to enforce enabled utilization caps. The invest loop rereads it before normal invests. |
+| `GRID_SEARCH_RESOLUTION` | `0.01` | allocation | Allocation granularity of the MAX_YIELD strategy family as a fraction of AUM, in (0, 1]. A lower value finds better yield but uses exponentially more resources. |
+| `GRID_SEARCH_MAX_CANDIDATES` | `5000000` | allocation | Maximum candidates one MAX_YIELD-family grid search counts for one vault, across all phases. Each generated point and each evaluation counts once, and a point generated in two refinement regions counts twice. When the search reaches it, the vault keeps its current allocation for that pass. A positive integer. |
+| `GRID_SEARCH_MAX_MS` | `300000` | allocation | Maximum wall-clock time in milliseconds of one MAX_YIELD-family grid search for one vault. When the search reaches it, the vault keeps its current allocation for that pass. A positive integer. |
+| `ALLOCATION_DRY_RUN` | `false` | allocation | The allocation loop computes and logs allocations but sends no transactions; the invest loop still sends. When false, the allocation config sets dry run per entry or vault. |
 
-## How rebalancing works
+**Danger detection**
 
-One pass batch-fetches every configured vault and all of their reserves, sleeping 10 s and retrying on a
-partial fetch, because it never rebalances on incomplete state. Danger detection then runs over every
-vault, producing a per-vault directive: either skip, when the vault was just responded to, or rebalance
-with a given set of exclusions. A thrown error or timeout anywhere in the danger pass skips the whole
-iteration, failing closed rather than falling through to a normal rebalance.
+| Setting | Default | Used by | Description |
+| --- | --- | --- | --- |
+| `DANGER_BLACKLIST_PATH` | `./danger_blacklist.json` (required in production) | invest, danger, cli | Path to the danger-detection blacklist file, on a persistent volume; its directory must exist. The invest loop reads it to skip vaults with a pending evacuation or blacklisted exposure. Outside production an unset value falls back to an ephemeral dev-only file. |
+| `MARKET_PRICE_MAX_AGE_SECONDS` | `300` | invest, danger | Age limit in seconds of a KSwap market price. Danger checks freeze the current allocation pass, and the invest loop skips its crank-funding swaps, when a price is older. |
+| `MAX_STALE_PRICE_DURATION_SECONDS` | `3600` | danger | Scope price age limit L, in seconds. A zero or near-zero price is as old as the longer of its publish age and the time it has read zero. Safety score: 0.4 past L, 0.2 past 2L and 0 past 4L. A positive integer. |
+| `REINVEST_COOLDOWN_SECONDS` | `2700` | allocation, danger | Seconds after a transient danger pull-out during which the reserve gets no new funds in any vault: no new weight and no deposit. In memory: a restart clears it. A positive integer. |
+| `DANGER_PASS_INTERVAL_SECONDS` | `300` | allocation, danger | Maximum seconds the allocation loop sleeps between two passes, each of which starts with a danger pass. The loop sleeps for the smallest of this and every rebalanceFrequencySeconds; each vault still rebalances at its own frequency. The time a pass takes adds to the gap. A positive integer. |
+| `KAMINO_TOKEN_FLAGS_URL` | `https://tokens.kamino.finance/tokens-flags.json` | danger | Kamino token flags feed that tells which tokens are stablecoins or LSTs. |
 
-Next it fetches farm states and prices for every reserve supply farm and reward mint, but only for
-vaults with `includeReservesSupplyFarmRewardsApy` on, plus every vault token. Then, per vault, if its
-rebalance frequency has elapsed, it computes the new weights with that vault's strategy, sends the
-allocation updates in batches of 2 with the vault's LUT when it has one, waits 5 s, reloads state and
-sends an invest crank so the funds follow the new weights. Finally it sleeps for the smallest
-`rebalanceFrequencySeconds` across the whole config and repeats.
+**KSwap**
 
-The loop's sleep is that config-wide minimum, but each vault additionally checks its own
-`rebalanceFrequencySeconds` before acting. Restarts reset the per-vault timers, so a restart triggers a
-rebalance on the next pass unless the chain rejects it. Dry-run vaults are evaluated every pass
-regardless of frequency, since nothing is sent and so there is nothing to rate-limit.
+| Setting | Default | Used by | Description |
+| --- | --- | --- | --- |
+| `KSWAP_API_BASE_URL` | `https://api.kamino.finance/kswap` | invest, allocation, danger | Base URL of the KSwap API, for swap routes and market prices. |
+| `KSWAP_API_KEY` | — | invest, allocation, danger | Optional KSwap API key, sent as the x-api-key header. |
+| `DEFAULT_SWAP_SLIPPAGE_BPS` | `100` | invest | Swap slippage tolerance in basis points, a safe integer in [0, 10000). |
+| `DEFAULT_PRICE_SLIPPAGE_BPS` | `150` | invest | Independent reference-price tolerance in basis points, checked before signing a swap. |
 
-Failures are contained per vault. If weight computation throws, the loop falls back to sending only that
-vault's blacklist-enforcement instructions, force-zeroing dangerous reserves rather than skipping safety
-work; if even that fails, the vault is skipped and the others continue. Danger is scoped per vault, so
-one persistently dangerous vault never stalls the fleet.
+**Looping**
 
-### What lands on-chain
+| Setting | Default | Used by | Description |
+| --- | --- | --- | --- |
+| `LOOP_INTERVAL_MS` | `600000` | invest | Sleep in milliseconds between two invest passes. When a vault is invested is set by MIN_SECONDS_SINCE_LAST_INVEST. Must be a positive safe integer. |
+| `LOOP_HEARTBEAT_TIMEOUT_MS` | — | process | The health server reports not ready when a loop sends no heartbeat for this many milliseconds. Defaults to 3 x RPC_REQUEST_TIMEOUT_MS. |
+| `MIN_INVEST_TOKENS` | `10` | invest | A vault is invested only when its move, the larger of its deposits and its withdrawals, exceeds this many tokens. One count for every mint. |
+| `MIN_SECONDS_SINCE_LAST_INVEST` | `1200` | invest | Minimum seconds since a vault's last invest before it is invested again; converted to slots at run time. |
+| `RESERVE_INVEST_COOLDOWN_MS` | `600000` | invest, allocation | A reserve whose invest or disinvest instruction the programs reject for a vault is dropped from that vault's invests for this many milliseconds. 0 disables the cooldown. |
+| `VAULT_RESERVES_MAX_UNIQUE_RESERVES_PER_BATCH` | `50` | invest, allocation | Maximum number of unique reserves loaded in one batch of vault reserves. Must be greater than 0. |
 
-Every strategy ultimately emits one `update_reserve_allocation` per changed reserve, carrying a
-`target_allocation_weight` and a token `allocation_cap`.
+**Programs**
 
-The vault takes its cut before the reserves. The program computes the unallocated share from
-`unallocated_weight / (unallocated_weight + Σ reserve weights)`, bounded by `unallocated_tokens_cap`,
-then splits the remainder across reserves by weight. The bot never writes `unallocated_weight`, since
-the vault admin owns it, so raising it proportionally lowers everything the bot's weights control.
+| Setting | Default | Used by | Description |
+| --- | --- | --- | --- |
+| `KLEND_PROGRAM_ID` | `KLend2g3cP87fffoy8q1mQqGKjrxjC8boSyAYavgmjD` | invest, allocation, danger | Kamino Lend program address. |
+| `KVAULTS_PROGRAM_ID` | `KvauGMspG5k6rtzrqqn7WNn3oZdyKqLKwK2XWQ8FLjd` | invest, allocation, danger | Kamino Vaults program address. |
 
-Caps are preserved rather than managed. The bot re-sends each reserve's existing `token_allocation_cap`
-unchanged, including through a danger pull-out, which zeroes the weight and leaves the cap intact, and
-it uses the v1 instruction, preserving whatever `ctoken_allocation_cap` is already set. Both caps stay
-the vault admin's tool; treat them as a hard ceiling the bot cannot exceed.
+**General**
 
-Reserve whitelists gate increases only. Under `allow_allocations_in_whitelisted_reserves_only`, raising
-a weight or cap on a reserve with no add-allocation whitelist entry fails with `ReserveNotWhitelisted`;
-under `allow_invest_in_whitelisted_reserves_only`, the same applies to an invest that adds liquidity.
-Lowering a weight, and any invest that withdraws, are never gated, so a pull-out always goes through and
-a whitelist misconfiguration can only stall growth, not an exit.
+| Setting | Default | Used by | Description |
+| --- | --- | --- | --- |
+| `CLUSTER` | `mainnet-beta` | process | Solana cluster. The process environment value also selects the default PROFILE. |
+| `PROFILE` | — | process | Selects the .env.&lt;PROFILE&gt; file to load, so set it in the shell. Defaults to CLUSTER. |
+| `SERVER` | `true` | process | Run the health server, which reports ready while every enabled loop sends heartbeats and the allocation loop's danger passes are not failing. |
+| `SERVER_PORT` | `8080` | process | Health server port, an integer in [1, 65535]. An empty value uses the default. |
+| `VERBOSE` | `false` | allocation | Log the details of each allocation computation. |
 
-### The rebalance universe
+**Logging**
 
-Before any strategy runs, the vault's reserves are split three ways. **Healthy** reserves are the only
-ones a strategy may optimize over. **Blacklisted** reserves are permanently excluded and force-zeroed
-on-chain via explicit instructions. **Cooldown** reserves are excluded from receiving new allocation but
-not force-zeroed, so an existing position is left where it is.
+| Setting | Default | Used by | Description |
+| --- | --- | --- | --- |
+| `LOG_LEVEL` | `info` | logger | Winston log level. The logger package reads it directly. |
+<!-- settings:end -->
 
-All weight math, including drip rates, grid budgets and totals, happens on the healthy-universe scale,
-so a force-zeroed reserve cannot distort it.
-
-Which strategy runs, how the max-yield grid search works, and the `MAX_YIELD_DRIPPING` drip and
-dead-band rules are in [`docs/configuration.md`](./docs/configuration.md#strategies).
-
-## Danger detection and the pull-out mechanism
-
-Before each rebalance iteration, the bot scores every reserve of every configured vault
-(`investing-bot/src/danger/`). Each trigger returns a safety score in `[0, 1]`, and a reserve's scores
-multiply into one combined safety score, so several mild red flags compound into a pull-out that none of
-them would cause alone. When a reserve's combined score falls below the vault's risk-appetite threshold
-(`PARANOID` 0.5, `SENSIBLE` 0.3 by default, `YOLO` 0.1), the bot emergency-deinvests from it and forces
-its weight to zero in one shot, never stepped down gradually and never dripped. The full trigger list
-and per-appetite thresholds are in
-[`docs/configuration.md`](./docs/configuration.md#danger-trigger-catalog).
-
-For each dangerous reserve the bot builds an allocation update setting weight `0` while preserving the
-configured allocation cap, skipping reserves already at zero. It sends those zeroing instructions in
-batches of 2 with the vault's LUT, and sends them even if simulation fails, because a pull-out must not
-be blocked by a flaky simulation. It then waits 5 s, reloads vault state, sends a full deinvest crank,
-and reloads state again so completion is judged against post-deinvest balances. The vault is marked skip
-for this rebalance pass, enforced by the type system: a responded-to vault carries no rebalance
-parameters at all, so it structurally cannot be re-exposed in the same pass.
-
-If exposure remains afterwards, say because the reserve had no liquidity to withdraw, it is recorded as
-a pending evacuation for that vault in the `pendingEvacuations` array of the same
-`DANGER_BLACKLIST_PATH` file, so it survives a restart and is visible to both loops. Pending evacuations
-are retried every pass, block the invest loop from touching that vault, clear automatically once the
-exposure reaches zero, and are logged as needing operator intervention while they persist.
-
-Where the reserve lands afterwards depends on why it was flagged. A **catastrophic** flag means
-irreversible loss of funds, from an infinite mint or a collateral exchange-rate increase, and the
-reserve goes on the permanent blacklist persisted to `DANGER_BLACKLIST_PATH`. On every later iteration
-it is excluded from every strategy's optimization universe and its on-chain weight is kept force-zeroed.
-It leaves only by manual operator action; there is no auto-expiry. A **transient or market** flag,
-covering oracle divergence, thin exit liquidity, elevated supply APY, utilization squeeze and depeg,
-puts the reserve in a reinvest cooldown for 3 passes: excluded from receiving new allocation, but its
-existing position is left untouched and never force-zeroed. That stops a reserve which flaps in and out
-of danger from thrashing pull-out → reinvest → pull-out. Cooldowns are in-memory and reset on restart.
-
-Danger is scoped per vault, so only a vault just responded to skips its rebalance this iteration. Every
-other vault rebalances normally, with blacklisted reserves force-zeroed and cooldown reserves excluded
-from new allocation.
-
-### Fail-closed guarantees
-
-Bad or missing data never reads as "safe". Every reserve needs a positive market price no older than
-`MARKET_PRICE_MAX_AGE_SECONDS` (default 300), and missing, stale, malformed or failed trigger data
-freezes that allocation iteration rather than triggering either a blind rebalance or a blind mass
-withdrawal. A danger-pass error or timeout skips the rebalance and retries; the detector lives outside
-the loop, so its in-memory trigger baselines survive a transient failure and the catastrophic triggers
-are not blinded on the next pass.
-
-A corrupt or structurally invalid blacklist file makes every danger pass throw, so no rebalance runs.
-The loop retries indefinitely rather than halting the process, so fix the file. The peg feed
-(`https://tokens.kamino.finance/tokens-flags.json`) is fetched once per pass, and an outage reuses the
-last good snapshot while a cold start with no snapshot at all fails the pass closed. A vault marked
-dry-run, globally or per entry or per vault, is detected and logged only and never receives real
-emergency transactions; catastrophic observations seen only by a dry-run vault stay staged rather than
-being committed as a new baseline.
-
-### Blacklist operations
-
-The file is JSON with two arrays. `blacklistedReserves` holds the reserve, trigger name, a
-human-readable reason carrying the exact scores, and a timestamp (see
-[`danger_blacklist_example.json`](./danger_blacklist_example.json)); `pendingEvacuations` holds the same
-plus the vault address.
-
-Manage it with the CLI. Every subcommand takes `--path`, defaulting to `DANGER_BLACKLIST_PATH`; a
-relative `--path` resolves against `investing-bot/`, so prefer an absolute one.
-
-```bash
-yarn cli danger init                       # create an empty blacklist file (no-op if it exists)
-yarn cli danger list                       # show blacklisted reserves with trigger, reason, timestamp
-yarn cli danger clear-reserve <address>    # un-blacklist one reserve (manual re-entry decision)
-yarn cli danger clear-all                  # clear the whole blacklist
-```
-
-Clearing a reserve is the operator saying "this was a false positive, or the cause is resolved". The bot
-starts allocating to it again on the next pass, subject to the triggers re-scoring it.
-
-The CLI covers `blacklistedReserves` only: `list` does not print pending evacuations, and neither
-`clear-reserve` nor `clear-all` removes them. A pending evacuation normally clears itself once the
-exposure is out. One stuck because the reserve genuinely cannot be exited has to be edited out by hand,
-and only after deciding the exposure is acceptable. While it is listed, the invest loop leaves that
-vault alone.
-
-## Tuning
-
-Grid resolution is the main cost knob. If the allocation worker approaches its 4 GB heap cap or passes
-get slow, raise `GRID_SEARCH_RESOLUTION` before anything else. Rolling a new strategy or a new vault out
-under `allocationDryRun` first lets it run in observation mode, with danger detection still evaluating
-and logging but no transaction ever sent for that vault.
+<!-- prettier-ignore-end -->

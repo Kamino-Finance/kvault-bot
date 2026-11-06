@@ -1,287 +1,91 @@
 import { Decimal } from 'decimal.js';
-import {
-  KaminoManager,
-  KaminoReserve,
-  KaminoVault,
-  LedgerInstant,
-  ReserveAllocationConfig,
-  ReserveWithAddress,
-} from '@kamino-finance/klend-sdk';
-import { Address, IInstruction, TransactionSigner } from '@solana/kit';
+import { Address } from '@solana/kit';
 import { logger } from 'kvaults-investing-bot-logger';
-import { AllocationWithAPY, AllocationWithAPYAndIxs } from '../utils/maxYieldOptimizers.js';
-import { computeOverallVaultAPYFromReservesMap } from '../utils/allocationHelper.js';
-import { ReserveWeight } from '../rebalanceConfig.js';
-import { getAllocationCapInTokensOrDefault, shouldUpdateAllocation } from '../vaultUtils.js';
+import { AllocationWithAPY } from '../utils/maxYieldOptimizers.js';
+import { calculateTotalWeight } from '../utils/allocationConstraints.js';
 import { DEFAULT_ALLOCATION_WEIGHT } from '../consts.js';
-import { getReserveAllocationsForUniverse, getVaultReserveAddressesInUniverse } from '../rebalanceUniverse.js';
+import { StrategyContext, StrategyTarget } from '../strategyRegistry.js';
+import { computeWeightsApy } from './common.js';
 
-export async function getUnchangedAllocationRebalanceIxs(
-  kaminoManager: KaminoManager,
-  kaminoVault: KaminoVault,
-  vaultsReserves: Map<Address, KaminoReserve>,
-  currentLedgerInstant: LedgerInstant,
-  compoundingPeriods: number = 1,
-  verbose: boolean = false,
-  allVaultReserves: Map<Address, KaminoReserve> = vaultsReserves,
-  forcedZeroReserves: ReadonlySet<string> = new Set()
-): Promise<AllocationWithAPYAndIxs> {
-  const vaultState = await kaminoVault.getState();
-  const vaultHoldings = await kaminoManager.getVaultHoldings(
-    vaultState,
-    currentLedgerInstant,
-    allVaultReserves,
-    currentLedgerInstant
-  );
-  const currentReservesAllocations = getReserveAllocationsForUniverse(vaultState, vaultsReserves);
-  const bestAllocation: AllocationWithAPY = {
-    reservesWithAllocation: currentReservesAllocations,
-    apy: computeOverallVaultAPYFromReservesMap(
-      currentReservesAllocations,
-      currentReservesAllocations,
-      vaultHoldings.totalAUMIncludingFees.sub(vaultHoldings.pendingFees ?? 0),
-      vaultHoldings.investedInReserves,
-      vaultsReserves,
-      currentLedgerInstant,
-      compoundingPeriods,
-      verbose,
-      {
-        vaultState,
-        vaultAUMTokens: vaultHoldings.totalAUMIncludingFees.sub(vaultHoldings.pendingFees ?? 0),
-        currentVaultAllocations: kaminoManager.getVaultAllocations(vaultState),
-        allVaultReserves,
-        currentLedgerInstant,
-        forcedZeroReserves,
-      }
-    ),
-  };
-  return { ixns: [], bestAllocation };
+/**
+ * The APY of `weights`, scored like the drift step scores its weights. The APY only feeds the allocation log, so a
+ * scoring failure logs a warning and reports 0 instead of failing the pass.
+ */
+export async function scoreWeights(ctx: StrategyContext, weights: Map<Address, Decimal>): Promise<Decimal> {
+  if (calculateTotalWeight(weights).lte(0)) {
+    return new Decimal(0);
+  }
+  try {
+    return await computeWeightsApy(ctx, weights);
+  } catch (error) {
+    logger.warn(
+      `[allocation-rebalance-loop] Failed to compute the APY for vault ${ctx.kaminoVault.address.toString()}: ${error}`
+    );
+    return new Decimal(0);
+  }
 }
 
-export async function getFixedWeightsAllocationRebalanceIxs(
-  kaminoManager: KaminoManager,
-  kaminoVault: KaminoVault,
-  vaultsReserves: Map<Address, KaminoReserve>,
-  fixedReservesWeights: ReserveWeight[],
-  signer: TransactionSigner,
-  currentLedgerInstant: LedgerInstant,
-  compoundingPeriods: number = 1,
-  verbose: boolean = false,
-  allVaultReserves: Map<Address, KaminoReserve> = vaultsReserves,
-  forcedZeroReserves: ReadonlySet<string> = new Set()
-): Promise<AllocationWithAPYAndIxs> {
-  const vaultState = await kaminoVault.getState();
-  const currentReservesWithWeights = getReserveAllocationsForUniverse(vaultState, vaultsReserves);
-  const allocationRebalanceIxs: IInstruction[] = [];
-  const bestAllocation: AllocationWithAPY = {
-    reservesWithAllocation: new Map(),
-    apy: new Decimal(0),
+/** The current allocation of the healthy reserves and its APY. The pipeline logs it for an 'unchanged' target. */
+export async function getUnchangedAllocation(ctx: StrategyContext): Promise<AllocationWithAPY> {
+  const currentReservesAllocations = new Map(ctx.vaultContext.healthyWeights);
+  return {
+    reservesWithAllocation: currentReservesAllocations,
+    apy: await scoreWeights(ctx, currentReservesAllocations),
   };
+}
 
-  for (const [reserve] of currentReservesWithWeights) {
+export async function computeUnchangedTarget(): Promise<'unchanged'> {
+  return 'unchanged';
+}
+
+/**
+ * The configured weight of every healthy reserve. `fixedReserves` must list each one: when one is missing, the vault keeps
+ * its current weights and the pipeline still zeroes its blacklisted reserves.
+ */
+export async function computeFixedWeightsTarget(ctx: StrategyContext): Promise<StrategyTarget | 'unchanged'> {
+  const { kaminoVault, fixedReservesWeights } = ctx;
+  if (!fixedReservesWeights) {
+    throw new Error(
+      `Fixed reserve weights are required for FIXED_WEIGHTS strategy on vault ${kaminoVault.address.toString()}`
+    );
+  }
+  const weights = new Map<Address, Decimal>();
+  const missingReserves: Address[] = [];
+  for (const reserve of ctx.vaultContext.healthyWeights.keys()) {
     const fixedReserveWeight = fixedReservesWeights.find(
       ({ reserve: configuredReserve }) => configuredReserve === reserve
     );
-    if (!fixedReserveWeight) {
-      continue;
-    }
-    const kaminoReserveState = vaultsReserves.get(reserve);
-    if (!kaminoReserveState) {
-      throw new Error(`Reserve ${reserve} not found`);
-    }
-    bestAllocation.reservesWithAllocation.set(reserve, new Decimal(fixedReserveWeight.weight));
-    const reserveWithAddress: ReserveWithAddress = {
-      address: reserve,
-      state: kaminoReserveState.state,
-    };
-    const reserveAllocationConfig = new ReserveAllocationConfig(
-      reserveWithAddress,
-      fixedReserveWeight.weight,
-      getAllocationCapInTokensOrDefault(vaultState, reserve)
-    );
-    if (shouldUpdateAllocation(vaultState, reserveAllocationConfig)) {
-      logger.info(
-        `[allocation-rebalance-loop] Updating reserve allocation for vault ${kaminoVault.address.toString()} with reserve ${reserve} to weight ${fixedReserveWeight.weight}`
-      );
-      const updateIxs = await kaminoManager.updateVaultReserveAllocationIxs(
-        kaminoVault,
-        reserveAllocationConfig,
-        signer
-      );
-      allocationRebalanceIxs.push(updateIxs.updateReserveAllocationIx);
+    if (fixedReserveWeight) {
+      weights.set(reserve, new Decimal(fixedReserveWeight.weight));
+    } else {
+      missingReserves.push(reserve);
     }
   }
-
-  const vaultHoldings = await kaminoManager.getVaultHoldings(
-    vaultState,
-    currentLedgerInstant,
-    allVaultReserves,
-    currentLedgerInstant
-  );
-  bestAllocation.apy = computeOverallVaultAPYFromReservesMap(
-    bestAllocation.reservesWithAllocation,
-    getReserveAllocationsForUniverse(vaultState, vaultsReserves),
-    vaultHoldings.totalAUMIncludingFees.sub(vaultHoldings.pendingFees ?? 0),
-    vaultHoldings.investedInReserves,
-    vaultsReserves,
-    currentLedgerInstant,
-    compoundingPeriods,
-    verbose,
-    {
-      vaultState,
-      vaultAUMTokens: vaultHoldings.totalAUMIncludingFees.sub(vaultHoldings.pendingFees ?? 0),
-      currentVaultAllocations: kaminoManager.getVaultAllocations(vaultState),
-      allVaultReserves,
-      currentLedgerInstant,
-      forcedZeroReserves,
-    }
-  );
-  return { ixns: allocationRebalanceIxs, bestAllocation };
+  if (missingReserves.length > 0) {
+    logger.error(
+      `[allocation-rebalance-loop] FIXED_WEIGHTS vault ${kaminoVault.address.toString()} has no configured weight for healthy reserve(s) ${missingReserves.join(', ')}; keeping its current weights. Add every healthy reserve to fixedReserves.`
+    );
+    return 'unchanged';
+  }
+  return { weights };
 }
 
-export async function getEqualAllocationRebalanceIxs(
-  kaminoManager: KaminoManager,
-  kaminoVault: KaminoVault,
-  vaultsReserves: Map<Address, KaminoReserve>,
-  signer: TransactionSigner,
-  currentLedgerInstant: LedgerInstant,
-  compoundingPeriods: number = 1,
-  verbose: boolean = false,
-  allVaultReserves: Map<Address, KaminoReserve> = vaultsReserves,
-  forcedZeroReserves: ReadonlySet<string> = new Set()
-): Promise<AllocationWithAPYAndIxs> {
-  const vaultState = await kaminoVault.getState();
-  const reserves = getVaultReserveAddressesInUniverse(kaminoManager, vaultState, vaultsReserves);
-  const vaultHoldings = await kaminoManager.getVaultHoldings(
-    vaultState,
-    currentLedgerInstant,
-    allVaultReserves,
-    currentLedgerInstant
-  );
-  const allocationRebalanceIxs: IInstruction[] = [];
-  const bestAllocation: AllocationWithAPY = {
-    reservesWithAllocation: new Map(),
-    apy: new Decimal(0),
-  };
-
-  logger.info(
-    `[allocation-rebalance-loop] Rebalancing allocation for vault ${kaminoVault.address.toString()}; strategy: EQUAL; ${reserves
-      .map((reserve) => `Reserve ${reserve.toString()} weight: ${DEFAULT_ALLOCATION_WEIGHT};`)
-      .join(' ')}`
-  );
-  for (const reserve of reserves) {
-    const kaminoReserveState = vaultsReserves.get(reserve);
-    if (!kaminoReserveState) {
-      throw new Error(`Reserve ${reserve} not found`);
-    }
-    bestAllocation.reservesWithAllocation.set(reserve, new Decimal(DEFAULT_ALLOCATION_WEIGHT));
-    const reserveAllocationConfig = new ReserveAllocationConfig(
-      { address: reserve, state: kaminoReserveState.state },
-      DEFAULT_ALLOCATION_WEIGHT,
-      getAllocationCapInTokensOrDefault(vaultState, reserve)
-    );
-    if (shouldUpdateAllocation(vaultState, reserveAllocationConfig)) {
-      const updateIxs = await kaminoManager.updateVaultReserveAllocationIxs(
-        kaminoVault,
-        reserveAllocationConfig,
-        signer
-      );
-      allocationRebalanceIxs.push(updateIxs.updateReserveAllocationIx);
-    }
+/**
+ * A target that gives each healthy reserve, in vault order, the weight `nextWeight` returns for it. The pipeline logs
+ * the weights it writes.
+ */
+async function computePerReserveTarget(ctx: StrategyContext, nextWeight: () => number): Promise<StrategyTarget> {
+  const weights = new Map<Address, Decimal>();
+  for (const reserve of ctx.vaultContext.healthyWeights.keys()) {
+    weights.set(reserve, new Decimal(nextWeight()));
   }
-
-  bestAllocation.apy = computeOverallVaultAPYFromReservesMap(
-    bestAllocation.reservesWithAllocation,
-    getReserveAllocationsForUniverse(vaultState, vaultsReserves),
-    vaultHoldings.totalAUMIncludingFees.sub(vaultHoldings.pendingFees ?? 0),
-    vaultHoldings.investedInReserves,
-    vaultsReserves,
-    currentLedgerInstant,
-    compoundingPeriods,
-    verbose,
-    {
-      vaultState,
-      vaultAUMTokens: vaultHoldings.totalAUMIncludingFees.sub(vaultHoldings.pendingFees ?? 0),
-      currentVaultAllocations: kaminoManager.getVaultAllocations(vaultState),
-      allVaultReserves,
-      currentLedgerInstant,
-      forcedZeroReserves,
-    }
-  );
-  return { ixns: allocationRebalanceIxs, bestAllocation };
+  return { weights };
 }
 
-export async function getRandomAllocationRebalanceIxs(
-  kaminoManager: KaminoManager,
-  kaminoVault: KaminoVault,
-  vaultsReserves: Map<Address, KaminoReserve>,
-  signer: TransactionSigner,
-  currentLedgerInstant: LedgerInstant,
-  compoundingPeriods: number = 1,
-  verbose: boolean = false,
-  allVaultReserves: Map<Address, KaminoReserve> = vaultsReserves,
-  forcedZeroReserves: ReadonlySet<string> = new Set()
-): Promise<AllocationWithAPYAndIxs> {
-  const vaultState = await kaminoVault.getState();
-  const reserves = getVaultReserveAddressesInUniverse(kaminoManager, vaultState, vaultsReserves);
-  const vaultHoldings = await kaminoManager.getVaultHoldings(
-    vaultState,
-    currentLedgerInstant,
-    allVaultReserves,
-    currentLedgerInstant
-  );
-  const weights = reserves.map(() => Math.floor(Math.random() * 100_000) + 100);
-  const allocationRebalanceIxs: IInstruction[] = [];
-  const bestAllocation: AllocationWithAPY = {
-    reservesWithAllocation: new Map(),
-    apy: new Decimal(0),
-  };
+export async function computeEqualTarget(ctx: StrategyContext): Promise<StrategyTarget> {
+  return computePerReserveTarget(ctx, () => DEFAULT_ALLOCATION_WEIGHT);
+}
 
-  logger.info(
-    `[allocation-rebalance-loop] Rebalancing allocation for vault ${kaminoVault.address.toString()}; strategy: RANDOM; ${reserves
-      .map((reserve, index) => `Reserve ${reserve.toString()} weight: ${weights[index]};`)
-      .join(' ')}`
-  );
-  for (let index = 0; index < reserves.length; index++) {
-    const reserve = reserves[index];
-    const weight = weights[index];
-    const kaminoReserveState = vaultsReserves.get(reserve);
-    if (!kaminoReserveState) {
-      throw new Error(`Reserve ${reserve} not found`);
-    }
-    const reserveAllocationConfig = new ReserveAllocationConfig(
-      { address: reserve, state: kaminoReserveState.state },
-      weight,
-      getAllocationCapInTokensOrDefault(vaultState, reserve)
-    );
-    if (shouldUpdateAllocation(vaultState, reserveAllocationConfig)) {
-      const updateIxs = await kaminoManager.updateVaultReserveAllocationIxs(
-        kaminoVault,
-        reserveAllocationConfig,
-        signer
-      );
-      allocationRebalanceIxs.push(updateIxs.updateReserveAllocationIx);
-    }
-    bestAllocation.reservesWithAllocation.set(reserve, new Decimal(weight));
-  }
-
-  bestAllocation.apy = computeOverallVaultAPYFromReservesMap(
-    bestAllocation.reservesWithAllocation,
-    getReserveAllocationsForUniverse(vaultState, vaultsReserves),
-    vaultHoldings.totalAUMIncludingFees.sub(vaultHoldings.pendingFees ?? 0),
-    vaultHoldings.investedInReserves,
-    vaultsReserves,
-    currentLedgerInstant,
-    compoundingPeriods,
-    verbose,
-    {
-      vaultState,
-      vaultAUMTokens: vaultHoldings.totalAUMIncludingFees.sub(vaultHoldings.pendingFees ?? 0),
-      currentVaultAllocations: kaminoManager.getVaultAllocations(vaultState),
-      allVaultReserves,
-      currentLedgerInstant,
-      forcedZeroReserves,
-    }
-  );
-  return { ixns: allocationRebalanceIxs, bestAllocation };
+export async function computeRandomTarget(ctx: StrategyContext): Promise<StrategyTarget> {
+  return computePerReserveTarget(ctx, () => Math.floor(Math.random() * 100_000) + 100);
 }

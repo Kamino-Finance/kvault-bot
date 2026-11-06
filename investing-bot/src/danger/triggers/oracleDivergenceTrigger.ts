@@ -30,11 +30,25 @@ export class OracleDivergenceTrigger implements DangerTrigger {
     const mintAddress = reserve.state.liquidity.mintPubkey;
 
     try {
-      // The SDK flags a price it cannot trust (stale beyond the feed's max age, low confidence, or an
-      // unhealthy oracle account) as invalid. A frozen/invalid oracle is the classic pre-exploit
-      // condition, so fail closed here rather than comparing a stale price as if it were live. Not
-      // marked catastrophic — the oracle can recover, so this drives an emergency pull-out, not a
-      // permanent blacklist.
+      const scopeObservation = context.scopeOracleObservations?.get(reserveAddress);
+      if (context.scopeOracleObservations && (!scopeObservation || scopeObservation.kind === 'unavailable')) {
+        throw new Error(`Scope price is unavailable for reserve ${reserveAddress}`);
+      }
+      if (scopeObservation?.kind === 'zero') {
+        const marketPrice = context.marketPrices.get(mintAddress);
+        if (!marketPrice || !marketPrice.isFinite() || marketPrice.lte(0)) {
+          throw new Error(`missing positive market price for mint ${mintAddress}`);
+        }
+        return {
+          safetyScore: 1.0,
+          triggerName: this.name,
+          reserveAddress,
+          details: 'Scope price is zero or near zero. Oracle divergence is paused; the stale-price trigger scores it',
+        };
+      }
+      // The SDK flags a price it cannot trust as invalid. Fail closed rather than compare it as if it were live. Not
+      // marked catastrophic: the oracle can recover, so this drives an emergency pull-out, not a permanent blacklist.
+      // The stale-price trigger checks Scope freshness.
       if (!reserve.tokenOraclePrice.valid) {
         logger.error(
           `[danger-detection] oracle price is flagged invalid/stale for mint ${mintAddress} — failing closed`
@@ -46,7 +60,6 @@ export class OracleDivergenceTrigger implements DangerTrigger {
           details: `oracle price flagged invalid/stale for mint ${mintAddress} — failing closed`,
         };
       }
-
       const oraclePrice = reserve.tokenOraclePrice.price;
       const marketPrice = context.marketPrices.get(mintAddress);
 

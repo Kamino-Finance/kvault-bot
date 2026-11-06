@@ -1,20 +1,119 @@
 import fs from 'fs';
 import { logger } from 'kvaults-investing-bot-logger';
-import chalk from 'chalk';
 import { address, Address } from '@solana/kit';
 import { RiskAppetiteMode } from '../danger/dangerTypes.js';
-import { RebalanceStrategy } from './rebalanceTypes.js';
-import {
-  DEFAULT_DRIPPING_RATE_PERCENT,
-  DEFAULT_ENFORCE_UTILIZATION_CAP,
-  DEFAULT_MAX_VAULT_DOMINANCE_BPS,
-  MAX_UTILIZATION_CHANGE_BPS,
-} from './consts.js';
+import './strategies/index.js';
+import { DEFAULT_MAX_VAULT_DOMINANCE_BPS } from './consts.js';
 import { FULL_BPS } from './utils/allocationHelper.js';
+import {
+  DRIFT_RATE_PERCENT_FIELD,
+  getStrategy,
+  listStrategies,
+  resolveConfigFieldValue,
+  resolveStrategyConfig,
+  StrategyDefinition,
+} from './strategyRegistry.js';
 
 export const DEFAULT_REBALANCE_FREQUENCY_SECONDS = 3600;
 
-// TODO: support passing max allocation for reserve from config
+/**
+ * Fields the loader reads on an allocation entry. Anything else is a misplaced or misspelled setting.
+ * A field added to AllocationConfig without an entry here is a compile error.
+ */
+const ALLOCATION_ENTRY_KEYS = {
+  strategy: true,
+  vaults: true,
+  rebalanceFrequencySeconds: true,
+  includeReservesSupplyFarmRewardsApy: true,
+  allocationDryRun: true,
+  riskAppetiteMode: true,
+  maxVaultDominanceBps: true,
+} satisfies Record<keyof AllocationConfig, true>;
+
+/**
+ * Fields the loader reads on a vault object. Anything else is a misplaced or misspelled setting.
+ * A field added to VaultWithFixedReserves without an entry here is a compile error.
+ */
+const VAULT_OBJECT_KEYS = {
+  vault: true,
+  strategy: true,
+  fixedReserves: true,
+  reservesAllocationPercentageBPS: true,
+  fixedReservesStrategy: true,
+  rebalanceFrequencySeconds: true,
+  includeReservesSupplyFarmRewardsApy: true,
+  allocationDryRun: true,
+  maxVaultDominanceBps: true,
+} satisfies Record<keyof VaultWithFixedReserves, true>;
+
+/** The registered strategies an entry applies: its own strategy and every vault-object override. */
+function entryStrategies(allocation: AllocationConfig): StrategyDefinition[] {
+  const names = new Set<string>([allocation.strategy]);
+  if (Array.isArray(allocation.vaults)) {
+    for (const vault of allocation.vaults) {
+      if (vault !== null && typeof vault === 'object' && typeof vault.strategy === 'string') {
+        names.add(vault.strategy);
+      }
+    }
+  }
+  return [...names].flatMap((name) => getStrategy(name) ?? []);
+}
+
+/** The known keys at one level: the common fields plus the fields that `strategies` declare at that level. */
+function knownKeys(
+  commonKeys: object,
+  level: 'entry' | 'vault',
+  strategies: readonly StrategyDefinition[]
+): ReadonlySet<string> {
+  const keys = new Set(Object.keys(commonKeys));
+  for (const definition of strategies) {
+    for (const field of definition.configFields) {
+      if (field.level === level || field.level === 'both') {
+        keys.add(field.name);
+      }
+    }
+  }
+  return keys;
+}
+
+/** Runs the validator of every field that `strategies` declare at this level and `value` sets. */
+function validateStrategyFields(
+  value: object,
+  level: 'entry' | 'vault',
+  fieldPath: string,
+  strategies: readonly StrategyDefinition[]
+): void {
+  const record = value as Record<string, unknown>;
+  const validated = new Set<string>();
+  for (const definition of strategies) {
+    for (const field of definition.configFields) {
+      if (field.level !== level && field.level !== 'both') {
+        continue;
+      }
+      if (record[field.name] === undefined || validated.has(field.name)) {
+        continue;
+      }
+      validated.add(field.name);
+      field.validate?.(record[field.name], `${fieldPath}.${field.name}`);
+    }
+  }
+}
+
+/**
+ * Log unknown settings without rejecting the config, so danger detection can continue. Unknown settings use defaults.
+ */
+function reportUnknownKeys(value: object, knownKeys: ReadonlySet<string>, fieldPath: string): void {
+  for (const key of Object.keys(value)) {
+    if (!knownKeys.has(key)) {
+      logger.error(
+        `[allocation-rebalance-loop] ${fieldPath} has unknown field "${key}"; it is ignored and the default applies`
+      );
+    }
+  }
+}
+
+/** A strategy name. The loader accepts any registered name; `RebalanceStrategy` names the built-ins. */
+export type StrategyName = string;
 
 /**
  * Represents a reserve with a fixed weight for FIXED_WEIGHTS strategy
@@ -29,32 +128,26 @@ export interface ReserveWeight {
  */
 export interface VaultWithFixedReserves {
   vault: string;
-  strategy?: RebalanceStrategy;
+  strategy?: StrategyName;
   fixedReserves?: string[] | ReserveWeight[];
   reservesAllocationPercentageBPS?: number;
-  fixedReservesStrategy?: RebalanceStrategy;
+  fixedReservesStrategy?: StrategyName;
   rebalanceFrequencySeconds?: number;
   includeReservesSupplyFarmRewardsApy?: boolean; // if true, the reserve supply APY will be considered as well in the computation of max yield allocation
   allocationDryRun?: boolean; // if true, the allocation will not be executed, only the simulation will be done; if the global (in .env) is true, it will override the per-vault value
-  drippingRatePercent?: number; // MAX_YIELD_DRIPPING only: % of the gap between current and MAX_YIELD target weights closed per iteration; defaults to DEFAULT_DRIPPING_RATE_PERCENT
-  enforceUtilizationCap?: boolean; // MAX_YIELD_DRIPPING only: whether to cap each reserve's per-iteration utilization change; defaults to DEFAULT_ENFORCE_UTILIZATION_CAP
-  maxUtilizationChangeBps?: number; // MAX_YIELD_DRIPPING only: the per-iteration utilization-change cap (when enforced); defaults to MAX_UTILIZATION_CHANGE_BPS
   maxVaultDominanceBps?: number; // Danger detection: vault share of a reserve's total supply (bps) at or above which the dominant-depositor trigger forces a pull-out at any risk appetite; defaults to DEFAULT_MAX_VAULT_DOMINANCE_BPS (unset = graduated score only)
 }
 
 /**
  * Represents an allocation configuration for a set of vaults
  */
-interface AllocationConfig {
-  strategy: RebalanceStrategy;
+export interface AllocationConfig {
+  strategy: StrategyName;
   vaults: (string | VaultWithFixedReserves)[];
-  rebalanceFrequencySeconds?: number; // it should be present for all strategies except MAX_YIELD_WITH_FIXED_RESERVES where it should be per entry in that array
+  rebalanceFrequencySeconds?: number; // applies to every vault of the entry and wins over a vault-level value
   includeReservesSupplyFarmRewardsApy?: boolean; // if true, the reserve supply APY will be considered as well in the computation of max yield allocation
   allocationDryRun?: boolean; // if true, the allocation will not be executed, only the simulation will be done; if the global (in .env) is true, it will override the per-vault value
   riskAppetiteMode?: RiskAppetiteMode; // PARANOID, SENSIBLE, or YOLO — controls danger detection sensitivity for all vaults in this allocation
-  drippingRatePercent?: number; // MAX_YIELD_DRIPPING only: % of the gap between current and MAX_YIELD target weights closed per iteration; defaults to DEFAULT_DRIPPING_RATE_PERCENT
-  enforceUtilizationCap?: boolean; // MAX_YIELD_DRIPPING only: whether to cap each reserve's per-iteration utilization change; defaults to DEFAULT_ENFORCE_UTILIZATION_CAP
-  maxUtilizationChangeBps?: number; // MAX_YIELD_DRIPPING only: the per-iteration utilization-change cap (when enforced); defaults to MAX_UTILIZATION_CHANGE_BPS
   maxVaultDominanceBps?: number; // Danger detection: vault share of a reserve's total supply (bps) at or above which the dominant-depositor trigger forces a pull-out at any risk appetite; defaults to DEFAULT_MAX_VAULT_DOMINANCE_BPS (unset = graduated score only)
 }
 
@@ -74,13 +167,14 @@ export function readAllocationsConfig(configPath: string): AllocationsConfig {
     return { allocationsConfig: [] };
   }
 
-  // if any of the configs do not have includeReservesSupplyFarmRewardsApy, set it to true
   const configuredVaults = new Set<string>();
   config.allocationsConfig.forEach((allocation, allocationIndex) => {
     const allocationPath = `allocationsConfig[${allocationIndex}]`;
+    const strategiesOfEntry = entryStrategies(allocation);
+    reportUnknownKeys(allocation, knownKeys(ALLOCATION_ENTRY_KEYS, 'entry', strategiesOfEntry), allocationPath);
     validateRebalanceStrategy(allocation.strategy, `${allocationPath}.strategy`);
     validatePositiveFiniteNumber(allocation.rebalanceFrequencySeconds, `${allocationPath}.rebalanceFrequencySeconds`);
-    validateDrippingRatePercent(allocation.drippingRatePercent, `${allocationPath}.drippingRatePercent`);
+    validateStrategyFields(allocation, 'entry', allocationPath, strategiesOfEntry);
     validateOptionalBoolean(
       allocation.includeReservesSupplyFarmRewardsApy,
       `${allocationPath}.includeReservesSupplyFarmRewardsApy`
@@ -96,7 +190,6 @@ export function readAllocationsConfig(configPath: string): AllocationsConfig {
       allocation.allocationDryRun = false;
     }
     validateRiskAppetiteMode(allocation.riskAppetiteMode);
-    validateUtilizationCapConfig(allocation.enforceUtilizationCap, allocation.maxUtilizationChangeBps);
     validateMaxVaultDominanceBps(allocation.maxVaultDominanceBps);
     // Validate object-level overrides and materialize only fields whose legacy representation
     // requires it. Optional farm-reward settings stay undefined so the resolver can inherit the
@@ -110,11 +203,14 @@ export function readAllocationsConfig(configPath: string): AllocationsConfig {
         if (vault.strategy !== undefined) {
           validateRebalanceStrategy(vault.strategy, `${vaultPath}.strategy`);
         }
+        const effectiveStrategy = vault.strategy ?? allocation.strategy;
+        const effectiveDefinition = getStrategy(effectiveStrategy)!;
+        reportUnknownKeys(vault, knownKeys(VAULT_OBJECT_KEYS, 'vault', [effectiveDefinition]), vaultPath);
         if (vault.fixedReservesStrategy !== undefined) {
           validateRebalanceStrategy(vault.fixedReservesStrategy, `${vaultPath}.fixedReservesStrategy`);
         }
         validatePositiveFiniteNumber(vault.rebalanceFrequencySeconds, `${vaultPath}.rebalanceFrequencySeconds`);
-        validateDrippingRatePercent(vault.drippingRatePercent, `${vaultPath}.drippingRatePercent`);
+        validateStrategyFields(vault, 'vault', vaultPath, [effectiveDefinition]);
         validateBps(vault.reservesAllocationPercentageBPS, `${vaultPath}.reservesAllocationPercentageBPS`);
         validateOptionalBoolean(
           vault.includeReservesSupplyFarmRewardsApy,
@@ -127,28 +223,40 @@ export function readAllocationsConfig(configPath: string): AllocationsConfig {
         if (vault.fixedReserves !== undefined) {
           validateFixedReserves(vault.fixedReserves, `${vaultPath}.fixedReserves`);
         }
-        const effectiveStrategy = vault.strategy ?? allocation.strategy;
-        if (effectiveStrategy === RebalanceStrategy.FIXED_WEIGHTS) {
+        const effectiveBehaviours = effectiveDefinition.behaviours;
+        if (effectiveBehaviours.fixedReserveWeights) {
           if (!vault.fixedReserves || !isReserveWeightFormat(vault.fixedReserves)) {
             throw new Error(
-              `[allocation-rebalance-loop] ${vaultPath}.fixedReserves must contain { reserve, weight } entries for FIXED_WEIGHTS`
+              `[allocation-rebalance-loop] ${vaultPath}.fixedReserves must contain { reserve, weight } entries for ${effectiveStrategy}`
             );
           }
+        }
+        // Log unsupported floors without rejecting the config, so danger detection can continue.
+        // FIXED_WEIGHTS uses fixedReserves as weights, so only its percentage floor is ignored.
+        const hasIgnoredFloorSettings = effectiveBehaviours.fixedReserveWeights
+          ? vault.reservesAllocationPercentageBPS !== undefined
+          : (vault.fixedReserves !== undefined && vault.fixedReserves.length > 0) ||
+            vault.reservesAllocationPercentageBPS !== undefined;
+        if (hasIgnoredFloorSettings && !effectiveBehaviours.fixedReserveFloors) {
+          logger.error(
+            `[allocation-rebalance-loop] ${vaultPath} sets fixedReserves or reservesAllocationPercentageBPS but its strategy ${effectiveStrategy} ignores them; use MAX_YIELD_WITH_FIXED_RESERVES or MAX_YIELD_STABLE`
+          );
         }
         if (vault.allocationDryRun === undefined) {
           vault.allocationDryRun = false;
         }
-        validateUtilizationCapConfig(vault.enforceUtilizationCap, vault.maxUtilizationChangeBps);
         validateMaxVaultDominanceBps(vault.maxVaultDominanceBps);
         // If vault doesn't have its own strategy, inherit from allocation config
         if (vault.strategy === undefined) {
           vault.strategy = allocation.strategy;
         }
-      } else if (allocation.strategy === RebalanceStrategy.FIXED_WEIGHTS) {
+      } else if (getStrategy(allocation.strategy)!.behaviours.fixedReserveWeights) {
         throw new Error(
-          `[allocation-rebalance-loop] ${allocationPath}.vaults[${vaultIndex}] must be an object with fixedReserves for FIXED_WEIGHTS`
+          `[allocation-rebalance-loop] ${allocationPath}.vaults[${vaultIndex}] must be an object with fixedReserves for ${allocation.strategy}`
         );
       }
+      validateDriftRatePercentForStrategy(allocation, vault, `${allocationPath}.vaults[${vaultIndex}]`);
+      logIgnoredUtilizationCapThreshold(allocation, vault, `${allocationPath}.vaults[${vaultIndex}]`);
 
       const vaultAddress = getVaultAddress(vault);
       validateAddress(vaultAddress, `${allocationPath}.vaults[${vaultIndex}].vault`);
@@ -158,13 +266,17 @@ export function readAllocationsConfig(configPath: string): AllocationsConfig {
       configuredVaults.add(vaultAddress);
     });
   });
+  // An entry without vaults rebalances nothing, and the loop reads the first vault of each entry.
+  config.allocationsConfig = config.allocationsConfig.filter((allocation, allocationIndex) => {
+    if (allocation.vaults.length > 0) {
+      return true;
+    }
+    logger.warn(`[allocation-rebalance-loop] allocationsConfig[${allocationIndex}] lists no vaults; ignoring it`);
+    return false;
+  });
 
   logger.info('[allocation-rebalance-loop] vault allocation config: ', config);
   return config;
-}
-
-export function getAllocationConfig(strategy: string, config: AllocationsConfig): AllocationConfig | undefined {
-  return config.allocationsConfig.find((c) => c.strategy === strategy);
 }
 
 /**
@@ -193,16 +305,14 @@ export function getRebalanceFrequencySeconds(
 export interface FixedReservesWithConfig {
   fixedReserves: Address[];
   reservesAllocationPercentageBPS: number;
-  fixedReservesStrategy: RebalanceStrategy;
 }
 export function getFixedReservesWithConfig(vaultEntry: string | VaultWithFixedReserves): FixedReservesWithConfig {
   if (typeof vaultEntry === 'string') {
-    return { fixedReserves: [], reservesAllocationPercentageBPS: 0, fixedReservesStrategy: RebalanceStrategy.EQUAL };
+    return { fixedReserves: [], reservesAllocationPercentageBPS: 0 };
   }
   return {
     fixedReserves: getReserveAddresses(vaultEntry.fixedReserves).map((reserve) => address(reserve)),
     reservesAllocationPercentageBPS: vaultEntry.reservesAllocationPercentageBPS ?? 0,
-    fixedReservesStrategy: vaultEntry.fixedReservesStrategy ?? RebalanceStrategy.EQUAL,
   };
 }
 
@@ -211,16 +321,9 @@ export function getFixedReservesWithConfig(vaultEntry: string | VaultWithFixedRe
  */
 export function getVaultStrategy(
   vaultEntry: string | VaultWithFixedReserves,
-  defaultStrategy: RebalanceStrategy
-): RebalanceStrategy {
+  defaultStrategy: StrategyName
+): StrategyName {
   return typeof vaultEntry === 'string' ? defaultStrategy : (vaultEntry.strategy ?? defaultStrategy);
-}
-
-/**
- * Check if a vault entry has fixed reserves
- */
-export function hasFixedReserves(vaultEntry: string | VaultWithFixedReserves): boolean {
-  return typeof vaultEntry !== 'string' && Boolean(vaultEntry.fixedReserves?.length);
 }
 
 /**
@@ -235,17 +338,6 @@ export function isReserveWeightFormat(
     fixedReserves.every(
       (entry) => typeof entry === 'object' && entry !== null && 'reserve' in entry && 'weight' in entry
     )
-  );
-}
-
-/**
- * Check if a vault entry uses FIXED_WEIGHTS strategy with reserve weights
- */
-export function hasFixedWeights(vaultEntry: string | VaultWithFixedReserves): boolean {
-  return (
-    typeof vaultEntry !== 'string' &&
-    Boolean(vaultEntry.fixedReserves?.length) &&
-    isReserveWeightFormat(vaultEntry.fixedReserves)
   );
 }
 
@@ -280,11 +372,10 @@ export function validateConfiguredReserveMembership(
 /**
  * Get reserve weights configuration for FIXED_WEIGHTS strategy
  */
-export function getReserveWeights(vaultEntry: string | VaultWithFixedReserves): ReserveWeight[] | null {
-  if (typeof vaultEntry !== 'string' && hasFixedWeights(vaultEntry)) {
-    return vaultEntry.fixedReserves as ReserveWeight[];
-  }
-  return null;
+export function getReserveWeights(vaultEntry: string | VaultWithFixedReserves): ReserveWeight[] | undefined {
+  return typeof vaultEntry !== 'string' && isReserveWeightFormat(vaultEntry.fixedReserves)
+    ? vaultEntry.fixedReserves
+    : undefined;
 }
 
 /**
@@ -294,11 +385,11 @@ export function getAllocationDryRun(
   vaultAllocationConfig: AllocationConfig,
   vaultEntry: string | VaultWithFixedReserves
 ): boolean {
-  // Individual vault dry run overrides allocation dry run
+  // An object vault uses its own value; the loader sets it to false when unset, so it never inherits the entry's.
   if (typeof vaultEntry !== 'string' && vaultEntry.allocationDryRun !== undefined) {
     return vaultEntry.allocationDryRun;
   }
-  // Fall back to allocation dry run
+  // A string vault entry uses the entry-level value.
   return vaultAllocationConfig.allocationDryRun ?? false;
 }
 
@@ -335,12 +426,45 @@ function validateRiskAppetiteMode(value: RiskAppetiteMode | undefined): void {
   }
 }
 
-function validateRebalanceStrategy(value: RebalanceStrategy, fieldPath: string): void {
-  if (!Object.values(RebalanceStrategy).includes(value)) {
+function validateRebalanceStrategy(value: unknown, fieldPath: string): void {
+  if (typeof value !== 'string' || getStrategy(value) === undefined) {
     throw new Error(
-      `[allocation-rebalance-loop] Invalid ${fieldPath} "${value}". Must be one of: ${Object.values(
-        RebalanceStrategy
-      ).join(', ')}`
+      `[allocation-rebalance-loop] Invalid ${fieldPath} "${value}". Must be one of: ${listStrategies()
+        .map((definition) => definition.name)
+        .join(', ')}`
+    );
+  }
+}
+
+/**
+ * Log an inactive utilization threshold without rejecting the config, so danger detection can continue.
+ */
+function logIgnoredUtilizationCapThreshold(
+  allocation: AllocationConfig,
+  vault: string | VaultWithFixedReserves,
+  path: string
+): void {
+  const config = resolveStrategyConfig(getStrategy(getVaultStrategy(vault, allocation.strategy))!, allocation, vault);
+  if (config.maxUtilizationChangeBps !== undefined && config.enforceUtilizationCap !== true) {
+    logger.error(
+      `[allocation-rebalance-loop] ${path} sets maxUtilizationChangeBps but not enforceUtilizationCap: true, so the utilization cap stays off`
+    );
+  }
+}
+
+function validateDriftRatePercentForStrategy(
+  allocation: AllocationConfig,
+  vaultEntry: string | VaultWithFixedReserves,
+  vaultPath: string
+): void {
+  if (resolveConfigFieldValue(DRIFT_RATE_PERCENT_FIELD, allocation, vaultEntry) === undefined) {
+    return;
+  }
+  const strategy = getVaultStrategy(vaultEntry, allocation.strategy);
+  const { ownDriftRate } = getStrategy(strategy)!;
+  if (ownDriftRate) {
+    throw new Error(
+      `[allocation-rebalance-loop] ${vaultPath} gets driftRatePercent, but its strategy ${strategy} sets its drift rate with ${ownDriftRate.field}; remove driftRatePercent and set ${ownDriftRate.field} instead`
     );
   }
 }
@@ -354,12 +478,6 @@ function validatePositiveFiniteNumber(value: number | undefined, fieldPath: stri
 function validateOptionalBoolean(value: unknown, fieldPath: string): void {
   if (value !== undefined && typeof value !== 'boolean') {
     throw new Error(`[allocation-rebalance-loop] ${fieldPath} must be true or false`);
-  }
-}
-
-function validateDrippingRatePercent(value: number | undefined, fieldPath: string): void {
-  if (value !== undefined && (!Number.isFinite(value) || value <= 0 || value > 100)) {
-    throw new Error(`[allocation-rebalance-loop] ${fieldPath} must be a finite number in (0, 100]`);
   }
 }
 
@@ -418,31 +536,6 @@ function validateAddress(value: string, fieldPath: string): void {
 }
 
 /**
- * Validate the MAX_YIELD_DRIPPING utilization-cap fields (allocation-level or per-vault).
- * Fails config loading on a misconfiguration rather than silently freezing or disabling the cap.
- */
-function validateUtilizationCapConfig(enforceUtilizationCap: unknown, maxUtilizationChangeBps: unknown): void {
-  if (enforceUtilizationCap !== undefined && typeof enforceUtilizationCap !== 'boolean') {
-    throw new Error(
-      `[allocation-rebalance-loop] Invalid enforceUtilizationCap "${enforceUtilizationCap}" in allocation config. ` +
-        `Must be true or false.`
-    );
-  }
-  if (
-    maxUtilizationChangeBps !== undefined &&
-    (typeof maxUtilizationChangeBps !== 'number' ||
-      !Number.isFinite(maxUtilizationChangeBps) ||
-      maxUtilizationChangeBps <= 0 ||
-      maxUtilizationChangeBps > FULL_BPS)
-  ) {
-    throw new Error(
-      `[allocation-rebalance-loop] Invalid maxUtilizationChangeBps "${maxUtilizationChangeBps}" in allocation config. ` +
-        `Must be a number in (0, ${FULL_BPS}]. To disable the utilization cap, set enforceUtilizationCap to false.`
-    );
-  }
-}
-
-/**
  * Validate the danger-detection dominant-depositor threshold (allocation-level or per-vault).
  * A vault cannot hold more than all of a reserve, so the ceiling is 100%; zero or below would pull
  * out of every reserve unconditionally, which is a misconfiguration rather than a safety setting.
@@ -475,190 +568,4 @@ export function getMaxVaultDominanceBps(
     return vaultEntry.maxVaultDominanceBps;
   }
   return vaultAllocationConfig.maxVaultDominanceBps ?? DEFAULT_MAX_VAULT_DOMINANCE_BPS;
-}
-
-/**
- * Get the dripping rate percent for a vault entry (MAX_YIELD_DRIPPING strategy);
- * the per-vault value overrides the allocation-level value, falling back to the default
- */
-export function getDrippingRatePercent(
-  vaultAllocationConfig: AllocationConfig,
-  vaultEntry: string | VaultWithFixedReserves
-): number {
-  if (typeof vaultEntry !== 'string' && vaultEntry.drippingRatePercent !== undefined) {
-    return vaultEntry.drippingRatePercent;
-  }
-  return vaultAllocationConfig.drippingRatePercent ?? DEFAULT_DRIPPING_RATE_PERCENT;
-}
-
-/**
- * Get whether the per-reserve utilization-change cap is enforced for a vault entry
- * (MAX_YIELD_DRIPPING strategy); the per-vault value overrides the allocation-level
- * value, falling back to the default
- */
-export function getEnforceUtilizationCap(
-  vaultAllocationConfig: AllocationConfig,
-  vaultEntry: string | VaultWithFixedReserves
-): boolean {
-  if (typeof vaultEntry !== 'string' && vaultEntry.enforceUtilizationCap !== undefined) {
-    return vaultEntry.enforceUtilizationCap;
-  }
-  return vaultAllocationConfig.enforceUtilizationCap ?? DEFAULT_ENFORCE_UTILIZATION_CAP;
-}
-
-/**
- * Get the per-iteration utilization-change cap (in bps) for a vault entry
- * (MAX_YIELD_DRIPPING strategy); the per-vault value overrides the allocation-level
- * value, falling back to the default
- */
-export function getMaxUtilizationChangeBps(
-  vaultAllocationConfig: AllocationConfig,
-  vaultEntry: string | VaultWithFixedReserves
-): number {
-  if (typeof vaultEntry !== 'string' && vaultEntry.maxUtilizationChangeBps !== undefined) {
-    return vaultEntry.maxUtilizationChangeBps;
-  }
-  return vaultAllocationConfig.maxUtilizationChangeBps ?? MAX_UTILIZATION_CHANGE_BPS;
-}
-
-/**
- * Formats seconds into a human-readable duration
- * @param seconds Duration in seconds
- * @returns Formatted duration string
- */
-function formatDuration(seconds: number): string {
-  if (seconds < 60) {
-    return `${seconds} seconds`;
-  } else if (seconds < 3600) {
-    const minutes = Math.floor(seconds / 60);
-    return `${minutes} minute${minutes !== 1 ? 's' : ''}`;
-  } else if (seconds < 86400) {
-    const hours = Math.floor(seconds / 3600);
-    const minutes = Math.floor((seconds % 3600) / 60);
-    if (minutes === 0) {
-      return `${hours} hour${hours !== 1 ? 's' : ''}`;
-    }
-    return `${hours} hour${hours !== 1 ? 's' : ''} ${minutes} minute${minutes !== 1 ? 's' : ''}`;
-  } else {
-    const days = Math.floor(seconds / 86400);
-    const hours = Math.floor((seconds % 86400) / 3600);
-    if (hours === 0) {
-      return `${days} day${days !== 1 ? 's' : ''}`;
-    }
-    return `${days} day${days !== 1 ? 's' : ''} ${hours} hour${hours !== 1 ? 's' : ''}`;
-  }
-}
-
-/**
- * Prints the allocation configuration in a human-readable format
- * @param config The allocation configuration to print
- */
-export function printAllocationsConfig(config: AllocationsConfig): void {
-  // If there are no configurations, print a message and return
-  if (!config.allocationsConfig || config.allocationsConfig.length === 0) {
-    console.log('No allocation configurations found.');
-    return;
-  }
-
-  console.log(chalk?.bold('🔷 ALLOCATION CONFIGURATIONS') || '🔷 ALLOCATION CONFIGURATIONS');
-  console.log('='.repeat(80));
-
-  // Iterate through each allocation configuration
-  config.allocationsConfig.forEach((allocation, index) => {
-    console.log(chalk?.cyan(`\n📋 Allocation Config #${index + 1}:`) || `\n📋 Allocation Config #${index + 1}:`);
-    console.log(`  ${chalk?.bold('Strategy') || 'Strategy'}: ${allocation.strategy}`);
-
-    if (allocation.rebalanceFrequencySeconds) {
-      console.log(
-        `  ${chalk?.bold('Rebalance Frequency') || 'Rebalance Frequency'}: ${formatDuration(allocation.rebalanceFrequencySeconds)}`
-      );
-    }
-
-    console.log(
-      chalk?.yellow(`  🏦 Vaults (${allocation.vaults.length}):`) || `  🏦 Vaults (${allocation.vaults.length}):`
-    );
-
-    // Iterate through each vault in the allocation
-    allocation.vaults.forEach((vault, vaultIndex) => {
-      console.log(`\n    ${chalk?.green(`Vault #${vaultIndex + 1}:`) || `Vault #${vaultIndex + 1}:`}`);
-
-      // Handle simple string vaults
-      if (typeof vault === 'string') {
-        console.log(`      ${chalk?.bold('Address') || 'Address'}: ${vault}`);
-        console.log(`      ${chalk?.bold('Type') || 'Type'}: Simple vault`);
-        console.log(
-          `      ${chalk?.bold('Strategy') || 'Strategy'}: ${allocation.strategy} (inherited from allocation)`
-        );
-
-        if (allocation.rebalanceFrequencySeconds) {
-          console.log(
-            `      ${chalk?.bold('Rebalance Frequency') || 'Rebalance Frequency'}: ${formatDuration(allocation.rebalanceFrequencySeconds)} (inherited)`
-          );
-        }
-        if (allocation.includeReservesSupplyFarmRewardsApy !== undefined) {
-          console.log(
-            `      ${chalk?.bold('Include Reserves Supply Farm Rewards APY') || 'Include Reserves Supply Farm Rewards APY'}: ${allocation.includeReservesSupplyFarmRewardsApy}`
-          );
-        }
-        if (allocation.allocationDryRun !== undefined) {
-          console.log(
-            `      ${chalk?.bold('Allocation Dry Run') || 'Allocation Dry Run'}: ${allocation.allocationDryRun}`
-          );
-        }
-      }
-      // Handle complex vault objects
-      else {
-        const fixedReserves = vault.fixedReserves ?? [];
-        console.log(`      ${chalk?.bold('Address') || 'Address'}: ${vault.vault}`);
-        console.log(
-          `      ${chalk?.bold('Type') || 'Type'}: Complex vault with ${fixedReserves.length} fixed reserve(s)`
-        );
-        console.log(`      ${chalk?.bold('Strategy') || 'Strategy'}: ${vault.strategy}`);
-
-        if (vault.rebalanceFrequencySeconds) {
-          console.log(
-            `      ${chalk?.bold('Rebalance Frequency') || 'Rebalance Frequency'}: ${formatDuration(vault.rebalanceFrequencySeconds)}`
-          );
-        }
-
-        if (vault.includeReservesSupplyFarmRewardsApy !== undefined) {
-          console.log(
-            `      ${chalk?.bold('Include Reserves Supply Farm Rewards APY') || 'Include Reserves Supply Farm Rewards APY'}: ${vault.includeReservesSupplyFarmRewardsApy}`
-          );
-        }
-
-        if (vault.allocationDryRun !== undefined) {
-          console.log(`      ${chalk?.bold('Allocation Dry Run') || 'Allocation Dry Run'}: ${vault.allocationDryRun}`);
-        }
-
-        if (vault.reservesAllocationPercentageBPS !== undefined) {
-          const percentage = (vault.reservesAllocationPercentageBPS / 100).toFixed(2);
-          console.log(
-            `      ${chalk?.bold('Fixed Reserves Allocation') || 'Fixed Reserves Allocation'}: ${percentage}% (${vault.reservesAllocationPercentageBPS} BPS)`
-          );
-        }
-
-        if (vault.fixedReservesStrategy) {
-          console.log(
-            `      ${chalk?.bold('Fixed Reserves Strategy') || 'Fixed Reserves Strategy'}: ${vault.fixedReservesStrategy}`
-          );
-        }
-
-        console.log(`      ${chalk?.bold('Fixed Reserves') || 'Fixed Reserves'}:`);
-        if (isReserveWeightFormat(fixedReserves)) {
-          // FIXED_WEIGHTS format - show reserve addresses with weights
-          fixedReserves.forEach((reserveWeight, reserveIndex) => {
-            console.log(`        ${reserveIndex + 1}. ${reserveWeight.reserve} (weight: ${reserveWeight.weight})`);
-          });
-        } else {
-          // Traditional format - just show reserve addresses
-          fixedReserves.forEach((reserve, reserveIndex) => {
-            console.log(`        ${reserveIndex + 1}. ${reserve}`);
-          });
-        }
-      }
-    });
-
-    console.log('-'.repeat(80));
-  });
 }

@@ -1,18 +1,18 @@
 import type { KaminoManager, KaminoReserve, VaultState } from '@kamino-finance/klend-sdk';
-import type { Address } from '@solana/kit';
+import { isSolanaError, type Address } from '@solana/kit';
 import { logger } from 'kvaults-investing-bot-logger';
+import { RpcRequestError } from 'kvaults-investing-bot-tx/model';
 
-import { getEnvOrDefaultNum } from '../libs/utils/env.js';
+import { readNumber } from '../config/schema.js';
+import { SETTINGS } from '../config/settings.js';
 import { RPC_REQUEST_TIMEOUT_MS, withTimeout } from './timeout.js';
 
-const DEFAULT_MAX_UNIQUE_RESERVES_PER_BATCH = 50;
-
-export const VAULT_RESERVES_MAX_UNIQUE_RESERVES_PER_BATCH = getEnvOrDefaultNum(
-  'VAULT_RESERVES_MAX_UNIQUE_RESERVES_PER_BATCH',
-  DEFAULT_MAX_UNIQUE_RESERVES_PER_BATCH
+export const VAULT_RESERVES_MAX_UNIQUE_RESERVES_PER_BATCH = readNumber(
+  SETTINGS.VAULT_RESERVES_MAX_UNIQUE_RESERVES_PER_BATCH
 );
 
 // Keep this sequential: the SDK reserve loader fans out account/oracle reads internally.
+// A batch that fails to load is left out of the result; callers skip the vaults whose reserves are absent.
 export async function loadVaultsReservesInBatches(
   kaminoManager: KaminoManager,
   vaultStates: VaultState[],
@@ -32,11 +32,11 @@ export async function loadVaultsReservesInBatches(
   }
 
   for (let batchIndex = 0; batchIndex < batches.length; batchIndex += 1) {
-    const batch = batches[batchIndex];
-    const batchReserves = await withTimeout(
-      kaminoManager.loadVaultsReserves(batch),
-      RPC_REQUEST_TIMEOUT_MS,
-      `${label} batch ${batchIndex + 1}/${batches.length}`
+    const batchReserves = await loadBatchIsolatingFailures(
+      kaminoManager,
+      batches[batchIndex],
+      `${label} batch ${batchIndex + 1}/${batches.length}`,
+      heartbeat
     );
     batchReserves.forEach((reserve, reserveAddress) => {
       reserves.set(reserveAddress, reserve);
@@ -46,6 +46,60 @@ export async function loadVaultsReservesInBatches(
   }
 
   return reserves;
+}
+
+/**
+ * The SDK loads a batch as one unit, so one reserve with a broken oracle fails the whole call. A failed
+ * batch of several vaults is retried in halves, down to single vaults, so only the vaults holding the
+ * broken reserve stay unloaded; those are logged and left out for the callers to skip. An RPC failure is not about
+ * one vault: the batch is not split, because each retry would hit the same failure.
+ */
+async function loadBatchIsolatingFailures(
+  kaminoManager: KaminoManager,
+  vaults: VaultState[],
+  label: string,
+  heartbeat?: () => void | Promise<void>
+): Promise<Map<Address, KaminoReserve>> {
+  try {
+    return await withTimeout(kaminoManager.loadVaultsReserves(vaults), RPC_REQUEST_TIMEOUT_MS, label);
+  } catch (error) {
+    if (vaults.length === 1 || isRpcFailure(error)) {
+      logger.error(`${label} failed; the reserves of ${vaults.length} vault(s) stay unloaded this pass: ${error}`);
+      return new Map();
+    }
+    logger.warn(`${label} failed for ${vaults.length} vaults; retrying in halves to isolate the failure: ${error}`);
+    const middle = Math.ceil(vaults.length / 2);
+    const merged = new Map<Address, KaminoReserve>();
+    for (const half of [vaults.slice(0, middle), vaults.slice(middle)]) {
+      // Each retry can take one RPC timeout.
+      await heartbeat?.();
+      const loaded = await loadBatchIsolatingFailures(
+        kaminoManager,
+        half,
+        `${label} (${half.length} vault(s))`,
+        heartbeat
+      );
+      loaded.forEach((reserve, reserveAddress) => merged.set(reserveAddress, reserve));
+    }
+    return merged;
+  }
+}
+
+/** A deadline, an abort, an RPC error or a failed fetch: the endpoint failed, not the data of one vault. */
+function isRpcFailure(error: unknown): boolean {
+  return (
+    error instanceof RpcRequestError ||
+    isSolanaError(error) ||
+    (error instanceof Error && (error.name === 'TimeoutError' || error.name === 'AbortError')) ||
+    (error instanceof TypeError && error.message === 'fetch failed')
+  );
+}
+
+export function getMissingVaultReserves(
+  vaultReserveAddresses: Address[],
+  vaultsReserves: Map<Address, KaminoReserve>
+): Address[] {
+  return vaultReserveAddresses.filter((reserveAddr) => !vaultsReserves.has(reserveAddr));
 }
 
 function buildVaultStateReserveBatches(

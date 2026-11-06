@@ -1,37 +1,19 @@
+import './loadProfileEnv.js';
 import { dirname, join } from 'path';
 import { fileURLToPath } from 'url';
 import { Worker } from 'worker_threads';
-import { config } from 'dotenv';
-import { expand } from 'dotenv-expand';
 import type { Lightship } from 'lightship';
 import { logger } from 'kvaults-investing-bot-logger';
-import { Cluster } from 'kvaults-investing-bot-tx/model';
-import { getEnvOrDefault, getEnvOrDefaultBool, getEnvOrDefaultNum } from './libs/utils/env.js';
+import { Cluster, parseCluster } from 'kvaults-investing-bot-tx/model';
+import { readBoolean, readNumber, readString } from './config/schema.js';
+import { SETTINGS } from './config/settings.js';
 import { isProcessShuttingDown, markProcessShuttingDown } from './utils/shutdown.js';
-
-// always set timezone to UTC
-process.env.TZ = 'Universal';
-
-// Select and load the profile before reading any setting from it. Process-level PROFILE/CLUSTER
-// choose the file; values inside the file configure the bot, including the health server.
-const initialCluster = process.env.CLUSTER || 'mainnet-beta';
-const initialProfile = process.env.PROFILE || initialCluster;
-const envPath = `../.env.${initialProfile}`;
-try {
-  const envResult = config({ path: envPath });
-  if (envResult.error) {
-    console.log(`No .env file found at ${envPath}, using environment variables`);
-  } else {
-    expand(envResult);
-    console.log(`Loaded .env file from ${envPath}`);
-  }
-} catch (error) {
-  console.log(`Failed to load ${envPath}, using environment variables:`, error);
-}
+import { AllocationWorkerSupervisor } from './allocationWorkerSupervisor.js';
+import { LoopHealth } from './utils/loopHealth.js';
 
 // Start the health server before the bot loops.
-const server = getEnvOrDefaultBool('SERVER', true);
-const port = Number(process.env.SERVER_PORT || '8080');
+const server = readBoolean(SETTINGS.SERVER);
+const port = Number(process.env.SERVER_PORT || SETTINGS.SERVER_PORT.default);
 if (!Number.isSafeInteger(port) || port <= 0 || port > 65_535) {
   throw new Error(`SERVER_PORT must be an integer in [1, 65535], received "${process.env.SERVER_PORT}"`);
 }
@@ -46,6 +28,8 @@ if (server) {
   lightship = createLightship({
     detectKubernetes: false,
     port,
+    // The application's handlers own the shutdown order: worker first, health server last.
+    signals: [],
   });
 
   console.log(`✅ kvaults-bot health server is running on port ${port}`);
@@ -53,101 +37,39 @@ if (server) {
   console.log('Health server is waiting for loop heartbeats');
 }
 
-// Global type declaration for worker reference
-declare global {
-  var allocationWorker: Worker | undefined;
-}
-
 enum LoopName {
   Invest = 'invest-loop',
   AllocationRebalance = 'allocation-rebalance-loop',
 }
 
-type LoopHealthState = {
-  lastHeartbeatMs: number;
-  timeoutMs: number;
-};
-
 const LOOP_HEALTH_CHECK_INTERVAL_MS = 15_000;
 let loopHealthMonitor: NodeJS.Timeout | undefined;
-let lastReadinessState: boolean | undefined;
-const loopHealth = new Map<LoopName, LoopHealthState>();
+let loopHealth: LoopHealth<LoopName> | undefined;
 
 function configureLoopHealth(expectedLoops: LoopName[]) {
-  const defaultRpcTimeoutMs = getEnvOrDefaultNum('RPC_REQUEST_TIMEOUT_MS', 2 * 60_000);
-  const timeoutMs = getEnvOrDefaultNum('LOOP_HEARTBEAT_TIMEOUT_MS', defaultRpcTimeoutMs * 3);
-  if (!Number.isSafeInteger(timeoutMs) || timeoutMs <= 0) {
-    throw new Error('LOOP_HEARTBEAT_TIMEOUT_MS must be a positive safe integer');
-  }
-  loopHealth.clear();
-  expectedLoops.forEach((loopName) => {
-    loopHealth.set(loopName, {
-      lastHeartbeatMs: 0,
-      timeoutMs,
-    });
-  });
+  const defaultRpcTimeoutMs = readNumber(SETTINGS.RPC_REQUEST_TIMEOUT_MS);
+  const timeoutMs = readNumber(SETTINGS.LOOP_HEARTBEAT_TIMEOUT_MS) ?? defaultRpcTimeoutMs * 3;
+  const health = new LoopHealth(
+    expectedLoops,
+    timeoutMs,
+    lightship ? (ready) => (ready ? lightship!.signalReady() : lightship!.signalNotReady()) : undefined,
+    isProcessShuttingDown
+  );
+  loopHealth = health;
 
   if (loopHealthMonitor) {
     clearInterval(loopHealthMonitor);
   }
-  loopHealthMonitor = setInterval(updateReadinessFromHeartbeats, LOOP_HEALTH_CHECK_INTERVAL_MS);
-  updateReadinessFromHeartbeats();
+  loopHealthMonitor = setInterval(() => health.update(), LOOP_HEALTH_CHECK_INTERVAL_MS);
+  health.update();
 }
 
 function markLoopHeartbeat(loopName: LoopName) {
-  const state = loopHealth.get(loopName);
-  if (!state) {
-    return;
-  }
-
-  state.lastHeartbeatMs = Date.now();
-  updateReadinessFromHeartbeats();
+  loopHealth?.markHeartbeat(loopName);
 }
 
 function markLoopUnhealthy(loopName: LoopName) {
-  const state = loopHealth.get(loopName);
-  if (!state) {
-    return;
-  }
-
-  state.lastHeartbeatMs = 0;
-  updateReadinessFromHeartbeats();
-}
-
-function updateReadinessFromHeartbeats() {
-  if (!lightship) {
-    return;
-  }
-
-  if (isProcessShuttingDown()) {
-    setReadiness(false);
-    return;
-  }
-
-  const now = Date.now();
-  const staleLoops = [...loopHealth.entries()]
-    .filter(([, state]) => state.lastHeartbeatMs === 0 || now - state.lastHeartbeatMs > state.timeoutMs)
-    .map(([loopName]) => loopName);
-  const ready = staleLoops.length === 0;
-
-  if (!ready && lastReadinessState !== false) {
-    logger.warn(`[health] marking not ready; stale loops: ${staleLoops.join(', ')}`);
-  }
-
-  setReadiness(ready);
-}
-
-function setReadiness(ready: boolean) {
-  if (!lightship || lastReadinessState === ready) {
-    return;
-  }
-
-  if (ready) {
-    lightship.signalReady();
-  } else {
-    lightship.signalNotReady();
-  }
-  lastReadinessState = ready;
+  loopHealth?.markUnhealthy(loopName);
 }
 
 // Run loops in completely separate async contexts that don't block main thread
@@ -159,78 +81,41 @@ async function startLoopAsync(loopName: LoopName, loopFunction: () => Promise<vo
     logger.info(`Starting ${loopName}`);
     await loopFunction();
   } catch (error) {
-    logger.error(`${loopName} failed to start:`, error);
+    logger.error(`${loopName} failed:`, error);
     markLoopUnhealthy(loopName);
     // Don't crash the process, just log the error
   }
 }
 
-const MAX_ALLOCATION_WORKER_RESTARTS = 3;
-
-function startAllocationWorker(cluster: Cluster, previousRestartCount: number = 0) {
+function createAllocationWorkerSupervisor(cluster: Cluster): AllocationWorkerSupervisor {
   const currentFile = fileURLToPath(import.meta.url);
   const currentDir = dirname(currentFile);
   const workerPath = join(currentDir, 'allocation_worker.js');
 
-  logger.info('[allocation-worker] Starting allocation loop in worker thread');
-
-  const worker = new Worker(workerPath, {
-    workerData: { cluster },
-    resourceLimits: {
-      maxOldGenerationSizeMb: 4096, // 4GB heap limit
-      maxYoungGenerationSizeMb: 2048, // 2GB young generation
+  return new AllocationWorkerSupervisor({
+    createWorker: () =>
+      new Worker(workerPath, {
+        workerData: { cluster },
+        resourceLimits: {
+          maxOldGenerationSizeMb: 4096, // 4GB heap limit
+          maxYoungGenerationSizeMb: 2048, // 2GB young generation
+        },
+      }),
+    onHeartbeat: () => markLoopHeartbeat(LoopName.AllocationRebalance),
+    onUnhealthy: () => markLoopUnhealthy(LoopName.AllocationRebalance),
+    onDangerStatus: (failing) => loopHealth?.setDangerPassesFailing(failing),
+    onNoNewFundsReserves: (reserves) => {
+      noNewFundsReserves = new Set(reserves);
     },
+    isShuttingDown: isProcessShuttingDown,
   });
-
-  let restartCount = previousRestartCount;
-  let restartScheduled = false;
-
-  const scheduleRestart = () => {
-    if (restartScheduled || isProcessShuttingDown()) {
-      return;
-    }
-    if (restartCount >= MAX_ALLOCATION_WORKER_RESTARTS) {
-      logger.error('[allocation-worker] Max restarts reached, stopping');
-      markLoopUnhealthy(LoopName.AllocationRebalance);
-      return;
-    }
-
-    restartCount++;
-    restartScheduled = true;
-    logger.info(`[allocation-worker] Restarting worker (${restartCount}/${MAX_ALLOCATION_WORKER_RESTARTS})`);
-    setTimeout(() => startAllocationWorker(cluster, restartCount), 5000);
-  };
-
-  // Worker event handlers
-  worker.on('message', (message) => {
-    if (message.type === 'heartbeat') {
-      restartCount = 0;
-      markLoopHeartbeat(LoopName.AllocationRebalance);
-    } else if (message.type === 'error') {
-      logger.error('[allocation-worker] Worker error:', message.error);
-      markLoopUnhealthy(LoopName.AllocationRebalance);
-    }
-  });
-
-  worker.on('error', (error) => {
-    logger.error('[allocation-worker] Worker error:', error);
-    markLoopUnhealthy(LoopName.AllocationRebalance);
-  });
-
-  worker.on('exit', (code) => {
-    if (isProcessShuttingDown()) {
-      return;
-    }
-    logger.error(`[allocation-worker] Worker exited unexpectedly with code ${code}`);
-    markLoopUnhealthy(LoopName.AllocationRebalance);
-    scheduleRestart();
-  });
-
-  // Store worker reference for shutdown
-  globalThis.allocationWorker = worker;
-
-  // Note: Signal handlers are now handled globally in the main process
 }
+
+let allocationSupervisor: AllocationWorkerSupervisor | null = null;
+/**
+ * Deposit exclusions from the last successful danger pass. A worker restart retains them until its first successful pass.
+ */
+let noNewFundsReserves: ReadonlySet<string> = new Set();
 
 let shutdownTimeout: NodeJS.Timeout | null = null;
 
@@ -242,37 +127,19 @@ const gracefulShutdown = async (signal: string) => {
 
   markProcessShuttingDown();
   logger.info(`Received ${signal}, starting graceful shutdown...`);
-  setReadiness(false);
+  lightship?.signalNotReady();
 
   try {
-    // Stop the health server first
+    // Terminate worker thread if it exists
+    if (allocationSupervisor) {
+      await allocationSupervisor.stop();
+    }
+
+    // Lightship last: its shutdown sleeps, then schedules its own process exit, so the worker must be
+    // told to stop before that clock starts.
     if (lightship) {
       logger.info('Shutting down health server...');
       await lightship.shutdown();
-    }
-
-    // Terminate worker thread if it exists
-    if (globalThis.allocationWorker) {
-      logger.info('Terminating allocation worker...');
-      globalThis.allocationWorker.postMessage({ type: 'shutdown' });
-
-      // Give worker 5 seconds to terminate gracefully
-      await new Promise<void>((resolve) => {
-        const timeout = setTimeout(() => {
-          logger.warn('Worker did not terminate gracefully, forcing termination');
-          if (globalThis.allocationWorker) {
-            globalThis.allocationWorker.terminate();
-          }
-          resolve();
-        }, 5000);
-
-        if (globalThis.allocationWorker) {
-          globalThis.allocationWorker.once('exit', () => {
-            clearTimeout(timeout);
-            resolve();
-          });
-        }
-      });
     }
 
     logger.info('Graceful shutdown completed');
@@ -282,6 +149,12 @@ const gracefulShutdown = async (signal: string) => {
     process.exit(1);
   }
 };
+
+/**
+ * Force exit when graceful shutdown does not finish: after the worker's 5 s termination grace and lightship's 5 s
+ * shutdown delay, with margin, and inside Kubernetes' default 30 s termination grace period.
+ */
+const FORCE_EXIT_AFTER_MS = 20_000;
 
 // Force exit after timeout
 const forceExit = () => {
@@ -294,16 +167,14 @@ process.on('SIGINT', () => {
   logger.info('Received SIGINT (Ctrl+C)');
   gracefulShutdown('SIGINT');
 
-  // Force exit after 10 seconds if graceful shutdown fails
-  shutdownTimeout = setTimeout(forceExit, 10000);
+  shutdownTimeout = setTimeout(forceExit, FORCE_EXIT_AFTER_MS);
 });
 
 process.on('SIGTERM', () => {
   logger.info('Received SIGTERM');
   gracefulShutdown('SIGTERM');
 
-  // Force exit after 10 seconds if graceful shutdown fails
-  shutdownTimeout = setTimeout(forceExit, 10000);
+  shutdownTimeout = setTimeout(forceExit, FORCE_EXIT_AFTER_MS);
 });
 
 // Clean up timeout on successful exit
@@ -317,11 +188,11 @@ process.on('exit', () => {
 });
 
 async function main() {
-  const cluster = getEnvOrDefault('CLUSTER', 'mainnet-beta') as Cluster;
-  const profile = getEnvOrDefault('PROFILE', cluster);
+  const cluster = parseCluster(readString(SETTINGS.CLUSTER));
+  const profile = readString(SETTINGS.PROFILE) ?? cluster;
 
-  const investLoop = getEnvOrDefaultBool('INVEST_LOOP', false);
-  const allocationRebalanceLoop = getEnvOrDefaultBool('ALLOCATION_REBALANCE_LOOP', false);
+  const investLoop = readBoolean(SETTINGS.INVEST_LOOP);
+  const allocationRebalanceLoop = readBoolean(SETTINGS.ALLOCATION_REBALANCE_LOOP);
   configureLoopHealth([
     ...(investLoop ? [LoopName.Invest] : []),
     ...(allocationRebalanceLoop ? [LoopName.AllocationRebalance] : []),
@@ -338,25 +209,36 @@ async function main() {
     logger.info(`✅ kvaults-bot is running`);
   }
 
+  // Validate enabled loops before startup to avoid retrying invalid settings. The worker reads them again in its thread.
+  const investing = investLoop ? await import('./investing_loop.js') : undefined;
+  const investStart = await investing?.loadInvestLoopStart();
+  if (allocationRebalanceLoop) {
+    const { loadAllocationLoopStart } = await import('./allocation_loop.js');
+    await loadAllocationLoopStart();
+  }
+
   // Start loops in completely separate async contexts
-  if (investLoop) {
-    // Don't await - let it run independently
-    startLoopAsync(LoopName.Invest, async () => {
-      const { runInvestLoop } = await import('./investing_loop.js');
+  if (investing && investStart) {
+    // Don't await - let it run independently. startLoopAsync handles every error.
+    void startLoopAsync(LoopName.Invest, async () => {
       const { recursiveTryCatch } = await import('./libs/utils/recursiveTryCatch.js');
       await recursiveTryCatch(
-        () => runInvestLoop(cluster, () => markLoopHeartbeat(LoopName.Invest)),
+        () =>
+          investing.runInvestLoop(
+            cluster,
+            investStart,
+            () => markLoopHeartbeat(LoopName.Invest),
+            () => noNewFundsReserves
+          ),
         `[${LoopName.Invest}]`
       );
-    }).catch((e) => {
-      logger.error(`[${LoopName.Invest}] Critical error occurred:`, e);
-      markLoopUnhealthy(LoopName.Invest);
     });
   }
 
   if (allocationRebalanceLoop) {
-    // Run allocation loop directly in main thread to avoid worker thread issues
-    startAllocationWorker(cluster);
+    // The allocation loop runs in a supervised worker thread.
+    allocationSupervisor = createAllocationWorkerSupervisor(cluster);
+    allocationSupervisor.start();
   }
 
   // If no loops are enabled, just keep the health server running

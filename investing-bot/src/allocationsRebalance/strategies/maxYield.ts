@@ -1,173 +1,45 @@
 import { Decimal } from 'decimal.js';
-import { KaminoManager, KaminoReserve, KaminoVault, LedgerInstant } from '@kamino-finance/klend-sdk';
-import { FarmState } from '@kamino-finance/farms-sdk';
-import { Address, TransactionSigner } from '@solana/kit';
-import {
-  AllocationWithAPYAndIxs,
-  AllocationWithStabilizationFactorAndAPYAndIxs,
-  gridSearchAllocationForMaxApyCoarseToFine,
-  gridSearchAllocationForMinStabilizationFactorCoarseToFine,
-} from '../utils/maxYieldOptimizers.js';
-import { buildAllocationRebalanceInstructions, getVaultContext, logAllocationResult } from './common.js';
+import { Address } from '@solana/kit';
+import { gridSearch } from '../utils/maxYieldOptimizers.js';
+import { StrategyContext, StrategyTarget } from '../strategyRegistry.js';
+import { logAllocationResult } from './common.js';
 
-interface MaxYieldStrategyRequest {
-  kaminoManager: KaminoManager;
-  kaminoVault: KaminoVault;
-  vaultsReserves: Map<Address, KaminoReserve>;
-  signer: TransactionSigner;
-  currentLedgerInstant: LedgerInstant;
-  gridSearchResolution: number;
-  shouldIncludeFarmRewards: boolean;
-  compoundingPeriods?: number;
-  reservesWithMinAllocation?: Address[];
-  minTotalAllocationForSpecifiedReservesBPS?: Decimal;
-  farmsToFarmStateMap?: Map<Address, FarmState>;
-  pricesMap?: Map<Address, Decimal>;
-  verbose?: boolean;
-  allVaultReserves?: Map<Address, KaminoReserve>;
-  preservedReserves?: ReadonlySet<string>;
-  forcedZeroReserves?: ReadonlySet<string>;
+async function computeMaxYieldTargetWithFloors(
+  ctx: StrategyContext,
+  strategyName: string,
+  reservesWithMinAllocation: Address[],
+  minTotalAllocationForSpecifiedReservesBPS: Decimal
+): Promise<StrategyTarget> {
+  const bestAllocation = await gridSearch(ctx, {
+    objective: 'MAX_APY',
+    reservesWithMinAllocation,
+    minTotalAllocationBPS: minTotalAllocationForSpecifiedReservesBPS,
+  });
+  logAllocationResult(ctx.kaminoVault, strategyName, bestAllocation);
+  return { weights: bestAllocation.reservesWithAllocation, apy: bestAllocation.apy };
 }
 
-export async function getMaxYieldAllocationRebalanceIxs({
-  kaminoManager,
-  kaminoVault,
-  vaultsReserves,
-  signer,
-  currentLedgerInstant,
-  gridSearchResolution,
-  shouldIncludeFarmRewards,
-  compoundingPeriods = 1,
-  reservesWithMinAllocation = [],
-  minTotalAllocationForSpecifiedReservesBPS = new Decimal(0),
-  farmsToFarmStateMap,
-  pricesMap,
-  verbose = false,
-  allVaultReserves = vaultsReserves,
-  preservedReserves = new Set(),
-  forcedZeroReserves = new Set(),
-}: MaxYieldStrategyRequest): Promise<AllocationWithAPYAndIxs> {
-  const vaultContext = await getVaultContext(
-    kaminoManager,
-    kaminoVault,
-    vaultsReserves,
-    currentLedgerInstant,
-    allVaultReserves,
-    preservedReserves,
-    forcedZeroReserves
-  );
-  const bestAllocation = await gridSearchAllocationForMaxApyCoarseToFine(
-    kaminoManager,
-    vaultContext.vaultState,
-    vaultsReserves,
-    vaultContext.totalAllocationsWeights,
-    gridSearchResolution,
-    currentLedgerInstant,
-    vaultContext.vaultAUMTokens,
-    vaultContext.investedInReservesTokensMap,
-    shouldIncludeFarmRewards,
-    undefined,
-    undefined,
-    undefined,
-    compoundingPeriods,
-    reservesWithMinAllocation,
-    minTotalAllocationForSpecifiedReservesBPS,
-    undefined,
-    farmsToFarmStateMap,
-    pricesMap,
-    verbose,
-    undefined,
-    vaultContext.allocationProjectionContext,
-    vaultContext.allInvestedInReservesTokensMap
-  );
-  logAllocationResult(kaminoVault, 'MAX_YIELD', bestAllocation, reservesWithMinAllocation);
-  return {
-    ixns: await buildAllocationRebalanceInstructions(
-      kaminoManager,
-      kaminoVault,
-      vaultContext.vaultState,
-      vaultsReserves,
-      bestAllocation,
-      signer,
-      currentLedgerInstant,
-      allVaultReserves,
-      preservedReserves,
-      forcedZeroReserves
-    ),
-    bestAllocation,
-  };
+export async function computeMaxYieldTarget(ctx: StrategyContext): Promise<StrategyTarget> {
+  return computeMaxYieldTargetWithFloors(ctx, 'MAX_YIELD', [], new Decimal(0));
 }
 
-export async function getMaxYieldStabilizationAllocationRebalanceIxs({
-  kaminoManager,
-  kaminoVault,
-  vaultsReserves,
-  signer,
-  currentLedgerInstant,
-  gridSearchResolution,
-  shouldIncludeFarmRewards,
-  compoundingPeriods = 1,
-  reservesWithMinAllocation = [],
-  minTotalAllocationForSpecifiedReservesBPS = new Decimal(0),
-  farmsToFarmStateMap,
-  pricesMap,
-  verbose = false,
-  allVaultReserves = vaultsReserves,
-  preservedReserves = new Set(),
-  forcedZeroReserves = new Set(),
-}: MaxYieldStrategyRequest): Promise<AllocationWithStabilizationFactorAndAPYAndIxs> {
-  const vaultContext = await getVaultContext(
-    kaminoManager,
-    kaminoVault,
-    vaultsReserves,
-    currentLedgerInstant,
-    allVaultReserves,
-    preservedReserves,
-    forcedZeroReserves
+/** MAX_YIELD with a minimum combined search allocation across the vault's `fixedReserves`. */
+export async function computeMaxYieldWithFixedReservesTarget(ctx: StrategyContext): Promise<StrategyTarget> {
+  return computeMaxYieldTargetWithFloors(
+    ctx,
+    'MAX_YIELD_WITH_FIXED_RESERVES',
+    ctx.fixedReservesConfig.fixedReserves,
+    new Decimal(ctx.fixedReservesConfig.reservesAllocationPercentageBPS)
   );
-  const bestAllocation = await gridSearchAllocationForMinStabilizationFactorCoarseToFine(
-    kaminoManager,
-    vaultContext.vaultState,
-    vaultsReserves,
-    vaultContext.totalAllocationsWeights,
-    gridSearchResolution,
-    currentLedgerInstant,
-    vaultContext.vaultAUMTokens,
-    vaultContext.investedInReservesTokensMap,
-    shouldIncludeFarmRewards,
-    undefined,
-    undefined,
-    undefined,
-    compoundingPeriods,
-    reservesWithMinAllocation,
-    minTotalAllocationForSpecifiedReservesBPS,
-    undefined,
-    farmsToFarmStateMap,
-    pricesMap,
-    verbose,
-    vaultContext.allocationProjectionContext,
-    vaultContext.allInvestedInReservesTokensMap
-  );
-  logAllocationResult(
-    kaminoVault,
-    'MAX_YIELD_STABLE',
-    bestAllocation,
-    reservesWithMinAllocation,
-    bestAllocation.stabilizationFactor
-  );
-  return {
-    ixns: await buildAllocationRebalanceInstructions(
-      kaminoManager,
-      kaminoVault,
-      vaultContext.vaultState,
-      vaultsReserves,
-      bestAllocation,
-      signer,
-      currentLedgerInstant,
-      allVaultReserves,
-      preservedReserves,
-      forcedZeroReserves
-    ),
-    bestAllocation,
-  };
+}
+
+export async function computeMaxYieldStableTarget(ctx: StrategyContext): Promise<StrategyTarget> {
+  const { fixedReservesConfig } = ctx;
+  const bestAllocation = await gridSearch(ctx, {
+    objective: 'MIN_STABILIZATION',
+    reservesWithMinAllocation: fixedReservesConfig.fixedReserves,
+    minTotalAllocationBPS: new Decimal(fixedReservesConfig.reservesAllocationPercentageBPS),
+  });
+  logAllocationResult(ctx.kaminoVault, 'MAX_YIELD_STABLE', bestAllocation, bestAllocation.score);
+  return { weights: bestAllocation.reservesWithAllocation, apy: bestAllocation.apy };
 }

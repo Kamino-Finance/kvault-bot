@@ -1,19 +1,23 @@
 import fs from 'fs';
-import { logger } from 'kvaults-investing-bot-logger';
-import { getEnvOrDefault } from './env.js';
-import { FileNotFound, getFileMaybeYarnWorkspace } from './file.js';
+import { createKeyPairSignerFromBytes, KeyPairSigner } from '@solana/kit';
+import { KindSpecWithDefault, readPath } from '../../config/schema.js';
+import { getFileMaybeYarnWorkspace } from './file.js';
 
-export function readSecret(secretName: string, envSecretPath?: string) {
-  const envSecretPathName = envSecretPath ?? 'SECRET_PATH';
-  const path = getEnvOrDefault(envSecretPathName, `/run/secrets/${secretName}`);
+/**
+ * The signer of the keypair file named by `setting`: a JSON array of the 64 secret key bytes. A missing or malformed
+ * file throws one error that names the setting and the path.
+ */
+export async function loadKeypairSigner(setting: KindSpecWithDefault<'path', string>): Promise<KeyPairSigner> {
+  const path = readPath(setting);
   try {
-    return fs.readFileSync(getFileMaybeYarnWorkspace(path), 'utf8');
+    const bytes = JSON.parse(fs.readFileSync(getFileMaybeYarnWorkspace(path), 'utf8'));
+    return await createKeyPairSignerFromBytes(Uint8Array.from(bytes));
   } catch (err) {
-    if (!(err instanceof FileNotFound) && err.code !== 'ENOENT') {
-      logger.error(`An error occurred while trying to read the secret path: ${path}. Err: ${err}`);
-    } else {
-      logger.error(`Could not find the secret,: ${secretName}. Err: ${err}`);
-    }
-    throw new Error(`Could not read secret "${secretName}" from ${path}`, { cause: err });
+    throw new Error(
+      `${setting.name}: could not load a keypair from ${path}: ${err instanceof Error ? err.message : err}`,
+      {
+        cause: err,
+      }
+    );
   }
 }

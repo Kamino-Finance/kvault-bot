@@ -82,7 +82,6 @@
       "vaults": [
         {
           "vault": "5SGXWx2fX6bvkqipCciT3TYzKVPJXU1Ww7kLkeUhJfaC",
-          "strategy": "MAX_YIELD",
           "fixedReserves": [
             "2ov3CMqPBYG3jNBmmpXgK9KMW5GmU5GWZNGcwf7w3BC1",
             "H3t6qZ1JkguCNTi9uzVKqQ7dvt2cum4XiXWom6Gn5e5S"
@@ -94,7 +93,6 @@
         },
         {
           "vault": "7cYGMEwQKhdYdugAyQBEqtwG6KhHyuEDcgUrdfGaV6qV",
-          "strategy": "MAX_YIELD",
           "fixedReserves": ["D6q6wuQSrifJKZYpR1M8R4YawnLDtDsMmWM1NbBmgJ59"],
           "reservesAllocationPercentageBPS": 7000,
           "fixedReservesStrategy": "MAX_YIELD",

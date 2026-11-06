@@ -9,10 +9,10 @@ export async function wrapSol(
   c: ConnectionPool,
   owner: TransactionSigner,
   wsolDestinationAta: Address,
-  decimalAmount: Decimal
+  lamports: Decimal
 ): Promise<string> {
   const budgetIxs = createAddExtraComputeUnitsTransaction(5000);
-  const syncNativeIxs = getDepositWsolIxns(owner, wsolDestinationAta, decimalAmount.mul(10 ** 9).floor());
+  const syncNativeIxs = getDepositWsolIxns(owner, wsolDestinationAta, lamports.floor());
   return sendAndConfirmTransactionV0(c, owner, [...budgetIxs, ...syncNativeIxs], [], [], 'RebalanceWalletWrapSol', {
     reportSample: false,
     sendIfSimulationFailed: true,

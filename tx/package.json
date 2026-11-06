@@ -7,29 +7,25 @@
   "main": "dist/index.js",
   "types": "dist/index.d.ts",
   "exports": {
-    "./anchor": "./dist/anchor.js",
-    "./ata": "./dist/ata.js",
     "./blockhash": "./dist/blockhash.js",
-    "./compat": "./dist/compat.js",
     "./computeBudget": "./dist/computeBudget.js",
     "./ConnectionPool": "./dist/ConnectionPool.js",
     "./instruction": "./dist/instruction.js",
     "./model": "./dist/model/index.js",
     "./priority": "./dist/priority/index.js",
-    "./utils": "./dist/utils/index.js",
-    "./keypair": "./dist/keypair.js"
+    "./utils": "./dist/utils/index.js"
   },
   "scripts": {
     "build": "yarn tsc"
   },
   "dependencies": {
-    "@noble/ed25519": "^2.1.0",
-    "@solana/kit": "^2.3.0",
-    "@solana/web3.js": "^1.98.2",
     "@solana-program/address-lookup-table": "^0.7.0",
     "@solana-program/compute-budget": "^0.7.0",
     "@solana-program/system": "^0.7.0",
-    "@solana-program/token-2022": "^0.4.0",
+    "@solana/addresses": "2.3.0",
+    "@solana/kit": "^2.3.0",
+    "@solana/rpc-types": "2.3.0",
+    "@solana/transaction-messages": "2.3.0",
     "axios": "^1.7.3",
     "decimal.js": "^10.4.3",
     "kvaults-investing-bot-logger": "*"

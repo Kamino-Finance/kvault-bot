@@ -13,13 +13,7 @@ import { batchFetch } from './utils/batch.js';
 
 export function getDepositWsolIxns(owner: TransactionSigner<string>, ata: Address, amountLamports: Decimal) {
   const ixns: Instruction[] = [];
-  ixns.push(
-    getTransferSolInstruction({
-      amount: BigInt(amountLamports.toString()),
-      source: owner,
-      destination: ata,
-    })
-  );
+  // Create the account before funding it, so the helper works on its own; creation is idempotent.
   ixns.push(
     getCreateAssociatedTokenIdempotentInstruction({
       owner: owner.address,
@@ -27,6 +21,13 @@ export function getDepositWsolIxns(owner: TransactionSigner<string>, ata: Addres
       ata: ata,
       mint: WRAPPED_SOL_MINT,
       tokenProgram: TOKEN_PROGRAM_ADDRESS,
+    })
+  );
+  ixns.push(
+    getTransferSolInstruction({
+      amount: BigInt(amountLamports.toString()),
+      source: owner,
+      destination: ata,
     })
   );
   ixns.push(getSyncNativeInstruction({ account: ata }, { programAddress: TOKEN_PROGRAM_ADDRESS }));

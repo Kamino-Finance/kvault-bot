@@ -4,7 +4,7 @@ import { logger } from 'kvaults-investing-bot-logger';
 import { ConnectionPool } from 'kvaults-investing-bot-tx/ConnectionPool';
 import { Cluster } from 'kvaults-investing-bot-tx/model';
 import { DEFAULT_MEDIAN_SLOT_DURATION_IN_MS } from '../libs/utils/consts.js';
-import { fromBaseEnv } from '../libs/utils/envConfig.js';
+import { SharedConfig } from '../config/loopConfig.js';
 import { getMedianSlotDurationInMsFromLastEpochsOrDefault, SlotDurationRefreshScheduler } from './solanaUtils.js';
 
 export interface KaminoManagerConsumer {
@@ -45,8 +45,18 @@ export class KaminoManagerRefreshCoordinator {
   }
 }
 
-export async function createLoopContext(cluster: Cluster) {
-  const envConfig = fromBaseEnv();
+/** A loop's settings with the connection pool and the KaminoManager built from them. */
+export interface LoopContext<Config extends SharedConfig> {
+  envConfig: Config;
+  connectionPool: ConnectionPool;
+  kaminoManager: KaminoManager;
+  refreshKaminoManager: () => Promise<KaminoManager>;
+}
+
+export async function createLoopContext<Config extends SharedConfig>(
+  cluster: Cluster,
+  envConfig: Config
+): Promise<LoopContext<Config>> {
   const connectionPool = ConnectionPool.new(
     cluster,
     envConfig.rpcEndpointsConfig,

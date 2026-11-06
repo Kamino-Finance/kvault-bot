@@ -3,11 +3,15 @@ import { KaminoReserve } from '@kamino-finance/klend-sdk';
 import { Decimal } from 'decimal.js';
 import { logger } from 'kvaults-investing-bot-logger';
 import { DEFAULT_BLACKLIST_PATH } from '../libs/utils/consts.js';
+import { SETTINGS } from '../config/settings.js';
 import { TokenFlags } from '../utils/tokenFlags.js';
 import { readBlacklistFile, updateBlacklistFile } from './blacklistStore.js';
 import {
   BlacklistEntry,
+  CollateralReserve,
+  CollateralTrigger,
   DangerTrigger,
+  MarketCollateralAssessment,
   ReserveRiskAssessment,
   RiskAppetiteMode,
   RISK_APPETITE_THRESHOLDS,
@@ -22,6 +26,7 @@ import { ExitLiquidityTrigger } from './triggers/vaultTriggers/exitLiquidityTrig
 import { InfiniteMintTrigger } from './triggers/infiniteMintTrigger.js';
 import { MarketUtilizationTrigger } from './triggers/marketUtilizationTrigger.js';
 import { OracleDivergenceTrigger } from './triggers/oracleDivergenceTrigger.js';
+import { StalePriceTrigger } from './triggers/stalePriceTrigger.js';
 import { SecondaryDepegTrigger } from './triggers/secondaryDepegTrigger.js';
 import { SupplyApySpikeTrigger } from './triggers/supplyApySpikeTrigger.js';
 
@@ -34,10 +39,19 @@ export function getDefaultTriggers(): DangerTrigger[] {
     new ExchangeRateTrigger(),
     new SupplyApySpikeTrigger(),
     new OracleDivergenceTrigger(),
+    new StalePriceTrigger(),
     new SecondaryDepegTrigger(),
     new MarketUtilizationTrigger(),
   ];
 }
+
+/** Collateral checks affect vault reserves in the same lending market. */
+export function getDefaultCollateralTriggers(): CollateralTrigger[] {
+  return [new InfiniteMintTrigger(), new StalePriceTrigger()];
+}
+
+/** The trigger name of a vault reserve's folded market collateral result. */
+export const MARKET_COLLATERAL_TRIGGER_NAME = 'market-collateral';
 
 /**
  * Default vault-specific triggers (run per (vault, reserve), since the score depends
@@ -60,56 +74,85 @@ function combineSafetyScore(product: number, score: number): number {
   return product * Math.min(score, 1);
 }
 
-// Number of danger passes a reserve is barred from receiving new allocation after a TRANSIENT
-// (non-catastrophic) pull-out, so a reserve that flaps in and out of danger settles instead of
-// thrashing pull-out → reinvest → pull-out. In-memory only: a process restart clears cooldowns,
-// which is acceptable (a cleared cooldown at worst permits one earlier reinvest, not a fund risk;
-// catastrophic reserves use the persistent blacklist, not this).
-const DEFAULT_REINVEST_COOLDOWN_PASSES = 3;
+/**
+ * Multiplies collateral scores and propagates any catastrophic result. Excludes the vault reserve to avoid scoring it twice.
+ */
+function marketCollateralResult(vaultReserve: Address, results: readonly TriggerResult[]): TriggerResult | undefined {
+  const collateralResults = results.filter((result) => result.reserveAddress !== vaultReserve);
+  if (collateralResults.length === 0) {
+    return undefined;
+  }
+  const flagged = collateralResults.filter((result) => result.safetyScore < 1 || result.catastrophic);
+  const collateralCount = new Set(collateralResults.map((result) => result.reserveAddress)).size;
+  return {
+    safetyScore: collateralResults.reduce((product, result) => combineSafetyScore(product, result.safetyScore), 1.0),
+    triggerName: MARKET_COLLATERAL_TRIGGER_NAME,
+    reserveAddress: vaultReserve,
+    details:
+      flagged.length === 0
+        ? `${collateralCount} market collateral reserve(s) safe`
+        : flagged
+            .map((result) => `${result.triggerName} on collateral ${result.reserveAddress}: ${result.details}`)
+            .join('; '),
+    catastrophic: collateralResults.some((result) => result.catastrophic === true),
+  };
+}
+
+// How long a reserve is barred from receiving new allocation after a TRANSIENT (non-catastrophic)
+// pull-out, so a reserve that flaps in and out of danger settles instead of thrashing pull-out →
+// reinvest → pull-out. Counted in time, not in danger passes, so the pass interval does not change
+// it. In-memory only: a process restart clears cooldowns, which is acceptable (a cleared cooldown at
+// worst permits one earlier reinvest, not a fund risk; catastrophic reserves use the persistent
+// blacklist, not this).
+const DEFAULT_REINVEST_COOLDOWN_MS = SETTINGS.REINVEST_COOLDOWN_SECONDS.default * 1000;
 
 export class DangerDetector {
   private readonly triggers: DangerTrigger[];
   private readonly vaultTriggers: VaultDangerTrigger[];
+  private readonly collateralTriggers: CollateralTrigger[];
   private readonly blacklistPath: string;
-  private readonly reinvestCooldownPasses: number;
-  // reserve address string → remaining passes during which it must not receive new allocation.
+  private readonly reinvestCooldownMs: number;
+  private readonly nowMs: () => number;
+  // reserve address string → time in ms at which it may receive new allocation again.
   private readonly reinvestCooldownByReserve: Map<string, number> = new Map();
 
   constructor(
     triggers: DangerTrigger[] = getDefaultTriggers(),
     vaultTriggers: VaultDangerTrigger[] = getDefaultVaultTriggers(),
     blacklistPath: string = DEFAULT_BLACKLIST_PATH,
-    reinvestCooldownPasses: number = DEFAULT_REINVEST_COOLDOWN_PASSES
+    reinvestCooldownMs: number = DEFAULT_REINVEST_COOLDOWN_MS,
+    nowMs: () => number = Date.now,
+    collateralTriggers: CollateralTrigger[] = getDefaultCollateralTriggers()
   ) {
     this.triggers = triggers;
     this.vaultTriggers = vaultTriggers;
+    this.collateralTriggers = collateralTriggers;
     this.blacklistPath = blacklistPath;
-    this.reinvestCooldownPasses = reinvestCooldownPasses;
+    this.reinvestCooldownMs = reinvestCooldownMs;
+    this.nowMs = nowMs;
   }
 
   /**
-   * Advance all reinvest cooldowns by one pass (call once at the start of each danger pass), dropping
-   * any that have elapsed. Returns the set of reserves still in cooldown AFTER the decrement — the
-   * reserves that must stay excluded from the rebalance optimizer this pass.
+   * Drop the reinvest cooldowns that have elapsed (call once at the start of each danger pass).
+   * Returns the reserves still in cooldown — the reserves that must stay excluded from the rebalance
+   * optimizer this pass.
    */
   tickReinvestCooldowns(): Set<string> {
-    for (const [reserve, remaining] of this.reinvestCooldownByReserve) {
-      if (remaining <= 1) {
+    const nowMs = this.nowMs();
+    for (const [reserve, endsAtMs] of this.reinvestCooldownByReserve) {
+      if (nowMs >= endsAtMs) {
         this.reinvestCooldownByReserve.delete(reserve);
-      } else {
-        this.reinvestCooldownByReserve.set(reserve, remaining - 1);
       }
     }
     return new Set(this.reinvestCooldownByReserve.keys());
   }
 
   /**
-   * Bar a reserve from receiving new allocation for the configured number of passes after a
-   * transient pull-out. Resets the window if the reserve is already cooling down (a fresh pull-out
-   * restarts the clock).
+   * Bar a reserve from receiving new allocation for the configured time after a transient pull-out.
+   * Restarts the window if the reserve is already cooling down (a fresh pull-out restarts the clock).
    */
   recordReinvestCooldown(reserve: string): void {
-    this.reinvestCooldownByReserve.set(reserve, this.reinvestCooldownPasses);
+    this.reinvestCooldownByReserve.set(reserve, this.nowMs() + this.reinvestCooldownMs);
   }
 
   /** Reserves currently in reinvest cooldown (excluded from new allocation). */
@@ -132,20 +175,70 @@ export class DangerDetector {
   }
 
   /**
-   * Run all reserve-intrinsic triggers on all reserves and compute combined safety per reserve.
+   * Marks failed collateral checks unreadable without aborting the pass. The caller blocks deposits into affected vault reserves.
+   */
+  async assessMarketCollateral(
+    rpc: Rpc<SolanaRpcApi>,
+    collateralByMarket: ReadonlyMap<Address, ReadonlyMap<Address, CollateralReserve>>,
+    context: TriggerContext,
+    heartbeat?: () => void
+  ): Promise<Map<Address, MarketCollateralAssessment>> {
+    const assessments = new Map<Address, MarketCollateralAssessment>();
+    for (const [market, collateral] of collateralByMarket) {
+      const results: TriggerResult[] = [];
+      const unreadable: Address[] = [];
+      for (const [reserveAddress, reserve] of collateral) {
+        heartbeat?.();
+        for (const trigger of this.collateralTriggers) {
+          try {
+            results.push(await trigger.check(rpc, reserveAddress, reserve, context));
+          } catch (error) {
+            logger.warn(
+              `[danger-detection] ${trigger.name} could not check collateral ${reserveAddress} of market ${market}: ${error}`
+            );
+            unreadable.push(reserveAddress);
+          }
+        }
+      }
+      assessments.set(market, { results, unreadable });
+    }
+    return assessments;
+  }
+
+  /** Commits the staged collateral trigger observations of the given market collateral. */
+  commitMarketCollateralObservations(collateral: Iterable<[Address, CollateralReserve]>, generation: number): void {
+    for (const [reserveAddress, reserve] of collateral) {
+      for (const trigger of this.collateralTriggers) {
+        trigger.commitObservation?.(reserveAddress, reserve, generation);
+      }
+    }
+  }
+
+  /**
+   * Run all reserve-intrinsic triggers on all reserves and compute combined safety per reserve. A reserve whose market
+   * has a collateral assessment also gets that market's folded collateral result.
    */
   async assessAllReserves(
     rpc: Rpc<SolanaRpcApi>,
     vaultsReservesMap: Map<Address, KaminoReserve>,
-    context: TriggerContext
+    context: TriggerContext,
+    heartbeat?: () => void,
+    marketCollateral: ReadonlyMap<Address, MarketCollateralAssessment> = new Map()
   ): Promise<Map<Address, ReserveRiskAssessment>> {
     const assessments = new Map<Address, ReserveRiskAssessment>();
 
     for (const [reserveAddress, reserve] of vaultsReservesMap) {
+      // Each trigger can make an RPC read, so a pass over many reserves reports progress per reserve.
+      heartbeat?.();
       const triggerResults: TriggerResult[] = [];
       for (const trigger of this.triggers) {
         const result = await trigger.check(rpc, reserveAddress, reserve, context);
         triggerResults.push(result);
+      }
+      const collateral = marketCollateral.size > 0 ? marketCollateral.get(reserve.state.lendingMarket) : undefined;
+      const collateralResult = collateral && marketCollateralResult(reserveAddress, collateral.results);
+      if (collateralResult) {
+        triggerResults.push(collateralResult);
       }
 
       const combinedSafety = triggerResults.reduce((product, r) => combineSafetyScore(product, r.safetyScore), 1.0);
@@ -159,13 +252,17 @@ export class DangerDetector {
    * Commit staged observations for the selected reserves after the coordinator has completed every
    * required safety side effect. Stateless triggers do not implement commitObservation.
    */
-  commitObservations(reserveAddresses: ReadonlySet<string>, reservesMap: Map<Address, KaminoReserve>): void {
+  commitObservations(
+    reserveAddresses: ReadonlySet<string>,
+    reservesMap: Map<Address, KaminoReserve>,
+    generation: number
+  ): void {
     for (const [reserveAddress, reserve] of reservesMap) {
       if (!reserveAddresses.has(reserveAddress.toString())) {
         continue;
       }
       for (const trigger of this.triggers) {
-        trigger.commitObservation?.(reserveAddress, reserve);
+        trigger.commitObservation?.(reserveAddress, reserve, generation);
       }
     }
   }
@@ -241,12 +338,10 @@ export class DangerDetector {
     return new Set(blacklist.blacklistedReserves.map((entry) => entry.reserve));
   }
 
-  getPendingEvacuationReserves(vaultAddress?: string): Set<string> {
+  getPendingEvacuationReserves(vaultAddress: string): Set<string> {
     const blacklist = readBlacklistFile(this.blacklistPath);
     return new Set(
-      blacklist.pendingEvacuations
-        .filter((entry) => vaultAddress === undefined || entry.vault === vaultAddress)
-        .map((entry) => entry.reserve)
+      blacklist.pendingEvacuations.filter((entry) => entry.vault === vaultAddress).map((entry) => entry.reserve)
     );
   }
 

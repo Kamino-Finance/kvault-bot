@@ -1,531 +1,558 @@
-import { getCurrentLedgerInstant, KaminoManager, KaminoReserve, KaminoVault } from '@kamino-finance/klend-sdk';
-import { address, Address, createKeyPairSignerFromBytes, IInstruction, KeyPairSigner } from '@solana/kit';
+import { KaminoManager, KaminoReserve, KaminoVault, VaultState } from '@kamino-finance/klend-sdk';
+import { address, Address, KeyPairSigner } from '@solana/kit';
 
 import { logger } from 'kvaults-investing-bot-logger';
 import { ConnectionPool } from 'kvaults-investing-bot-tx/ConnectionPool';
 import { Cluster } from 'kvaults-investing-bot-tx/model';
-import { DEFAULT_PUBLIC_KEY } from 'kvaults-investing-bot-tx/instruction';
-import { FarmState, fetchAllMaybeFarmState } from '@kamino-finance/farms-sdk';
-import { getLut } from './libs/lut.js';
-import { readSecret } from './libs/utils/secret.js';
+import { loadKeypairSigner } from './libs/utils/secret.js';
+import { SETTINGS } from './config/settings.js';
 import {
   AllocationsConfig,
-  getAllocationDryRun,
-  getDrippingRatePercent,
-  getEnforceUtilizationCap,
-  getMaxUtilizationChangeBps,
-  getFixedReservesWithConfig,
-  getIncludeReservesSupplyFarmRewardsApy,
   getRebalanceFrequencySeconds,
-  getReserveAddresses,
-  getReserveWeights,
   getVaultAddress,
-  getVaultStrategy,
-  printAllocationsConfig,
   readAllocationsConfig,
-  ReserveWeight,
-  validateConfiguredReserveMembership,
 } from './allocationsRebalance/rebalanceConfig.js';
-import { rebalanceAllocation, RebalanceStrategy } from './allocationsRebalance/rebalanceTypes.js';
-import { buildBlacklistEnforcementIxs } from './allocationsRebalance/rebalanceUniverse.js';
-import { getTokensBatchPrice } from './utils/price.js';
+import {
+  checkAdminVaultTokenBalances,
+  DueVault,
+  FarmData,
+  fetchFarmData,
+  selectDueVaults,
+  VaultRebalanceSchedule,
+} from './allocationsRebalance/dueVaults.js';
+import {
+  computeVaultRebalanceIxs,
+  isRebalanceDone,
+  sendVaultRebalance,
+} from './allocationsRebalance/vaultRebalance.js';
+import { DEFAULT_GRID_SEARCH_BUDGET, GridSearchBudget } from './allocationsRebalance/utils/maxYieldOptimizers.js';
 import { DangerDetector } from './danger/dangerDetector.js';
 import { DangerAssessmentResult, DangerCoordinator } from './danger/dangerCoordinator.js';
+import { depositFreezeVaults, reconcileDepositFreezes } from './danger/depositFreezes.js';
 import { RPC_REQUEST_TIMEOUT_MS, withTimeout } from './utils/timeout.js';
-import { loadVaultsReservesInBatches } from './utils/vaultReserves.js';
-import { interruptibleSleep, LoopHeartbeat } from './utils/loop.js';
-import { createLoopContext, KaminoManagerRefreshCoordinator } from './utils/loopContext.js';
+import { getMissingVaultReserves, loadVaultsReservesInBatches } from './utils/vaultReserves.js';
+import { attempt, interruptibleSleep, LoopHeartbeat, yieldAndBeat } from './utils/loop.js';
+import { createLoopContext, KaminoManagerRefreshCoordinator, LoopContext } from './utils/loopContext.js';
+import { AllocationLoopConfig, readAllocationLoopConfig } from './config/loopConfig.js';
 import { isProcessShuttingDown } from './utils/shutdown.js';
-import { sendInstructionBatches } from './utils/sendInstructionBatches.js';
+import { fetchConfiguredVaults } from './utils/vaultFetch.js';
+import { ReserveInvestCooldowns } from './utils/investReserves.js';
+import { getInvestUtilizationCap, readInvestUtilizationCaps } from './investing/utilizationCap.js';
 
-async function heartbeatSleepSeconds(seconds: number, heartbeat?: LoopHeartbeat) {
-  return interruptibleSleep(seconds * 1000, heartbeat);
+/** The allocation loop's settings, allocation config and key, read before the loop starts. */
+export interface AllocationLoopStart {
+  config: AllocationLoopConfig;
+  allocationsConfig: AllocationsConfig;
+  allocationAdmin: KeyPairSigner;
 }
 
-export async function runAllocationLoop(cluster: Cluster, heartbeat?: LoopHeartbeat) {
-  logger.info('[allocation-rebalance-loop] ✅ running allocation loop');
-  const { envConfig, connectionPool: c, kaminoManager, refreshKaminoManager } = await createLoopContext(cluster);
-
-  const allocationsConfig: AllocationsConfig = readAllocationsConfig(envConfig.allocationConfigPath);
-  printAllocationsConfig(allocationsConfig);
-
-  const allocationAdmin = await createKeyPairSignerFromBytes(
-    Buffer.from(JSON.parse(readSecret('allocation_admin', 'ALLOCATION_ADMIN_SECRET_PATH')))
-  );
-  logger.info(`[allocation-rebalance-loop] allocationAdmin ${allocationAdmin.address.toString()}`);
-  await runAllocationRebalanceLoop(
-    allocationsConfig,
-    c,
-    kaminoManager,
-    allocationAdmin,
-    envConfig.gridSearchResolution,
-    envConfig.verbose,
-    envConfig.allocationDryRun,
-    envConfig.blacklistPath,
-    envConfig.marketPriceMaxAgeSeconds,
-    heartbeat,
-    refreshKaminoManager
-  );
+/** Reads the allocation loop's settings, config file and key. A bad value throws, so the bot stops at startup. */
+export async function loadAllocationLoopStart(): Promise<AllocationLoopStart> {
+  const config = readAllocationLoopConfig();
+  return {
+    config,
+    allocationsConfig: readAllocationsConfig(config.allocationConfigPath),
+    allocationAdmin: await loadKeypairSigner(SETTINGS.ALLOCATION_ADMIN_SECRET_PATH),
+  };
 }
 
-export async function runAllocationRebalanceLoop(
-  allocationsConfig: AllocationsConfig,
-  c: ConnectionPool,
-  initialKaminoManager: KaminoManager,
-  allocationAdmin: KeyPairSigner,
-  gridSearchResolution: number,
-  verbose: boolean,
-  dryRun: boolean,
-  blacklistPath: string,
-  marketPriceMaxAgeSeconds: number,
+export async function runAllocationLoop(
+  cluster: Cluster,
   heartbeat?: LoopHeartbeat,
-  refreshKaminoManager?: () => Promise<KaminoManager>
+  onNoNewFundsReserves?: (reserves: string[]) => void
 ) {
-  // the min loop duration in the config which will determine how often the loop will run
-  let minSecondsLoopDuration = Number.MAX_VALUE;
-  const allVaultsAddresses: Address[] = [];
-  // a set of all tokens relevant for all vaults in allocations, including farm rewards; will be used to fetch prices for all tokens and compute the farm APYs
-  const allTokensMintsIncludingFarms: Set<Address> = new Set();
-  const farmToFarmStateMap = new Map<Address, FarmState>();
+  logger.info('[allocation-rebalance-loop] ✅ running allocation loop');
+  const { config, allocationsConfig, allocationAdmin } = await loadAllocationLoopStart();
+  logger.info(`[allocation-rebalance-loop] allocationAdmin ${allocationAdmin.address.toString()}`);
+  const loopContext = await createLoopContext(cluster, config);
+  await runAllocationPasses({ ...loopContext, allocationsConfig, allocationAdmin, onNoNewFundsReserves }, heartbeat);
+}
 
-  if (!allocationsConfig || !allocationsConfig.allocationsConfig || allocationsConfig.allocationsConfig.length === 0) {
+/** What the allocation loop runs on. Tests replace the danger coordinator and the sleep. */
+export interface AllocationLoopContext extends LoopContext<AllocationLoopConfig> {
+  allocationsConfig: AllocationsConfig;
+  allocationAdmin: KeyPairSigner;
+  dangerCoordinator?: Pick<DangerCoordinator, 'detectAndRespond' | 'updateKaminoManager'>;
+  sleep?: typeof interruptibleSleep;
+  /** Updates the invest loop's deposit exclusions after each successful danger pass. */
+  onNoNewFundsReserves?: (reserves: string[]) => void;
+}
+
+/** Runs allocation passes, each a danger pass and then the rebalance of the due vaults, until shutdown. */
+export async function runAllocationPasses(
+  {
+    envConfig,
+    connectionPool: c,
+    kaminoManager: initialKaminoManager,
+    refreshKaminoManager,
+    allocationsConfig,
+    allocationAdmin,
+    dangerCoordinator: injectedDangerCoordinator,
+    sleep = interruptibleSleep,
+    onNoNewFundsReserves,
+  }: AllocationLoopContext,
+  heartbeat?: LoopHeartbeat
+) {
+  const dryRun = envConfig.allocationDryRun;
+  const dangerPassIntervalSeconds = envConfig.dangerPassIntervalSeconds;
+  const gridSearchBudget: GridSearchBudget = {
+    maxCandidates: envConfig.gridSearchMaxCandidates,
+    maxMs: envConfig.gridSearchMaxMs,
+    now: DEFAULT_GRID_SEARCH_BUDGET.now,
+  };
+
+  if (allocationsConfig.allocationsConfig.length === 0) {
     logger.warn('[allocation-rebalance-loop] no allocations config found');
     while (!isProcessShuttingDown()) {
-      if (await heartbeatSleepSeconds(60, heartbeat)) {
+      if (await sleep(60_000, heartbeat)) {
         return;
       }
     }
     return;
-  } else {
-    // for the bot all restarts will trigger a rebalance unless blocked from the chain
-    const lastRebalanceTimestampInSecondsPerVault = new Map<string, number>();
-    allocationsConfig.allocationsConfig.forEach((allocation) => {
-      allocation.vaults.forEach((vaultEntry) => {
-        // Handle both string vault addresses and complex vault objects
-        const vaultAddress = getVaultAddress(vaultEntry);
+  }
 
-        allVaultsAddresses.push(address(vaultAddress));
-        lastRebalanceTimestampInSecondsPerVault.set(vaultAddress, 0);
+  // The smallest rebalance frequency in the config determines how often the loop runs.
+  const { vaultAddresses: allVaultsAddresses, minRebalanceFrequencySeconds: minSecondsLoopDuration } =
+    summarizeAllocations(allocationsConfig);
 
-        const rebalanceFrequencySeconds = getRebalanceFrequencySeconds(allocation, vaultEntry);
-        if (rebalanceFrequencySeconds < minSecondsLoopDuration) {
-          minSecondsLoopDuration = rebalanceFrequencySeconds;
-        }
-      });
+  // for the bot all restarts will trigger a rebalance unless blocked from the chain
+  const rebalanceSchedule = new VaultRebalanceSchedule(Math.min(minSecondsLoopDuration, dangerPassIntervalSeconds));
+  const dangerPasses = new DangerPassTracker(Date.now, (failing) =>
+    heartbeat?.(failing ? 'danger-failing' : 'danger-recovered')
+  );
+
+  const dangerCoordinator =
+    injectedDangerCoordinator ??
+    new DangerCoordinator(
+      new DangerDetector(undefined, undefined, envConfig.blacklistPath, envConfig.reinvestCooldownSeconds * 1000),
+      initialKaminoManager,
+      c,
+      allocationAdmin,
+      {
+        marketPriceMaxAgeSeconds: envConfig.marketPriceMaxAgeSeconds,
+        maxStalePriceDurationSeconds: envConfig.maxStalePriceDurationSeconds,
+        klendProgramId: envConfig.klendProgramId,
+      }
+    );
+  const kaminoManagerRefreshCoordinator = new KaminoManagerRefreshCoordinator(
+    initialKaminoManager,
+    refreshKaminoManager,
+    [dangerCoordinator]
+  );
+  const sleepUntilNextIteration = () => {
+    const sleepMilliseconds = getAllocationPassSleepMs(
+      minSecondsLoopDuration,
+      dangerPassIntervalSeconds,
+      kaminoManagerRefreshCoordinator.millisecondsUntilRefresh()
+    );
+    logger.info(`[allocation-rebalance-loop] sleeping for ${sleepMilliseconds / 1000} seconds`);
+    return sleep(sleepMilliseconds, heartbeat);
+  };
+  let hasOperationalCheckpoint = false;
+  // Own instance: this loop runs in its own worker and cannot share the investing loop's cooldowns.
+  const reserveInvestCooldowns = new ReserveInvestCooldowns(
+    envConfig.reserveInvestCooldownMs,
+    Date.now,
+    '[allocation-rebalance-loop]'
+  );
+
+  while (!isProcessShuttingDown()) {
+    reserveInvestCooldowns.tick();
+    await kaminoManagerRefreshCoordinator.refreshIfDue();
+    const kaminoManager = kaminoManagerRefreshCoordinator.getKaminoManager();
+
+    // Yield at start of each main loop iteration
+    await yieldAndBeat(hasOperationalCheckpoint ? heartbeat : undefined);
+
+    // batch fetch all vaults data and all reserves data. A throw here must not leave the loop: the
+    // worker would restart it and rebuild the danger detector, wiping the in-memory trigger baselines.
+    const idleHeartbeat = hasOperationalCheckpoint ? heartbeat : undefined;
+    const kaminoVaults =
+      (await attempt('[allocation-rebalance-loop] failed to fetch vaults data', () =>
+        fetchConfiguredVaults(kaminoManager, allVaultsAddresses, '[allocation-rebalance-loop]', idleHeartbeat)
+      )) ?? [];
+    const kaminoVaultsMap = new Map<Address, KaminoVault>();
+    kaminoVaults.forEach((kaminoVault) => {
+      if (kaminoVault) {
+        kaminoVaultsMap.set(kaminoVault.address, kaminoVault);
+      }
     });
-
-    // print the vaults to alloc and the rebalance frequency
-    allocationsConfig.allocationsConfig.forEach((allocation) => {
-      logger.info(
-        `[allocation-rebalance-loop] ${allocation.strategy}: ${allocation.vaults
-          .map((vault) => getVaultAddress(vault))
-          .join(', ')} rebalance frequency: ${getRebalanceFrequencySeconds(allocation, allocation.vaults[0])} seconds`
+    // A vault that does not load (closed, mistyped, or an RPC miss) is skipped for this pass only; the
+    // other vaults still get their danger pass and their rebalance.
+    const missingVaults = allVaultsAddresses.filter((vaultAddress) => !kaminoVaultsMap.has(vaultAddress));
+    if (missingVaults.length > 0) {
+      logger.error(
+        `[allocation-rebalance-loop] ${missingVaults.length} configured vault(s) could not be loaded and are skipped this pass: ${missingVaults.join(', ')}`
       );
-    });
-
-    const dangerDetector = new DangerDetector(undefined, undefined, blacklistPath);
-    const dangerCoordinator = new DangerCoordinator(dangerDetector, initialKaminoManager, c, allocationAdmin, {
-      marketPriceMaxAgeSeconds,
-    });
-    const kaminoManagerRefreshCoordinator = refreshKaminoManager
-      ? new KaminoManagerRefreshCoordinator(initialKaminoManager, refreshKaminoManager, [dangerCoordinator])
-      : undefined;
-    const sleepUntilNextIteration = () => {
-      const configuredSleepMilliseconds = minSecondsLoopDuration * 1000;
-      const sleepMilliseconds = kaminoManagerRefreshCoordinator
-        ? Math.min(configuredSleepMilliseconds, kaminoManagerRefreshCoordinator.millisecondsUntilRefresh())
-        : configuredSleepMilliseconds;
-      logger.info(`[allocation-rebalance-loop] sleeping for ${sleepMilliseconds / 1000} seconds`);
-      return interruptibleSleep(sleepMilliseconds, heartbeat);
-    };
-    let hasOperationalCheckpoint = false;
-
-    while (!isProcessShuttingDown()) {
-      let recomputedVaultApy = false;
-      await kaminoManagerRefreshCoordinator?.refreshIfDue();
-      const kaminoManager = kaminoManagerRefreshCoordinator?.getKaminoManager() ?? initialKaminoManager;
-
-      // Yield at start of each main loop iteration
-      await new Promise((resolve) => setImmediate(resolve));
-      if (hasOperationalCheckpoint) {
-        heartbeat?.();
+    }
+    if (kaminoVaultsMap.size === 0) {
+      // Nothing loaded: no vault gets a danger pass, which counts as a failed one. Sleep a while and try again. Before the
+      // first assessed pass this stall sends no heartbeat, so a bot that has never worked is not reported healthy.
+      dangerPasses.record(undefined);
+      if (await sleep(10_000, hasOperationalCheckpoint ? heartbeat : undefined)) {
+        return;
       }
+      continue;
+    }
 
-      // batch fetch all vaults data and all reserves data
-      const kaminoVaults = await withTimeout(
-        kaminoManager.getVaults(allVaultsAddresses),
-        RPC_REQUEST_TIMEOUT_MS,
-        '[allocation-rebalance-loop] fetch vaults'
-      );
-      if (!kaminoVaults.every((kaminoVault) => kaminoVault !== null)) {
-        logger.error('[allocation-rebalance-loop] failed to fetch all vaults data');
+    // Yield after fetching vaults
+    await yieldAndBeat(idleHeartbeat);
 
-        // if we can't fetch the vaults we sleep a while and try again
-        if (await interruptibleSleep(10_000, heartbeat)) {
-          return;
-        }
-        continue;
-      }
+    const { vaultStates, vaultsReserves } = await loadPassReserves(
+      kaminoManager,
+      kaminoVaultsMap,
+      idleHeartbeat,
+      heartbeat
+    );
 
-      // Yield after fetching vaults
-      await new Promise((resolve) => setImmediate(resolve));
-      if (hasOperationalCheckpoint) {
-        heartbeat?.();
-      }
+    // Yield after loading reserves
+    await yieldAndBeat(hasOperationalCheckpoint ? heartbeat : undefined);
 
-      const kaminoVaultsMap = new Map<Address, KaminoVault>();
-      kaminoVaults.forEach((kaminoVault) => {
-        if (kaminoVault) {
-          kaminoVaultsMap.set(kaminoVault.address, kaminoVault);
-        }
-      });
-
-      // Yield after creating vaults map
-      await new Promise((resolve) => setImmediate(resolve));
-      if (hasOperationalCheckpoint) {
-        heartbeat?.();
-      }
-
-      // this should not do any RPC call, the vaults are read already above but getState is async as it reads the state if not already fetched
-      const vaultStates = await Promise.all(kaminoVaults.map((kaminoVault) => kaminoVault!.getState()));
-      // add all vault tokens to the set of all tokens relevant for APY computation
-      vaultStates.forEach((vaultState) => {
-        allTokensMintsIncludingFarms.add(vaultState.tokenMint);
-      });
-
-      // Yield after processing vault states
-      await new Promise((resolve) => setImmediate(resolve));
-      if (hasOperationalCheckpoint) {
-        heartbeat?.();
-      }
-
-      // load the reserves for all vaults
-      const vaultsReserves = await loadVaultsReservesInBatches(
-        kaminoManager,
-        vaultStates,
-        '[allocation-rebalance-loop] load vault reserves',
-        hasOperationalCheckpoint ? heartbeat : undefined
-      );
-      const vaultsReservesMap = new Map<Address, KaminoReserve>();
-      vaultsReserves.forEach((vaultReserve) => {
-        if (vaultReserve) {
-          vaultsReservesMap.set(vaultReserve.address, vaultReserve);
-        }
-      });
-
-      // Yield after loading reserves
-      await new Promise((resolve) => setImmediate(resolve));
-      hasOperationalCheckpoint = true;
-      heartbeat?.();
-
-      // --- DANGER DETECTION ---
-      let dangerResult: DangerAssessmentResult;
-      try {
-        dangerResult = await withTimeout(
-          dangerCoordinator.detectAndRespond(
-            allocationsConfig,
-            kaminoVaultsMap,
-            vaultsReservesMap,
-            vaultsReserves,
-            dryRun,
-            heartbeat
-          ),
+    // --- DANGER DETECTION ---
+    const dangerResult = await attempt(
+      '[allocation-rebalance-loop] Danger detection failed; skipping rebalance this iteration',
+      () =>
+        withTimeout(
+          dangerCoordinator.detectAndRespond(allocationsConfig, kaminoVaultsMap, vaultsReserves, dryRun, heartbeat),
           Math.max(allVaultsAddresses.length, 1) * RPC_REQUEST_TIMEOUT_MS * 4,
           '[allocation-rebalance-loop] danger detection pass'
-        );
-      } catch (e) {
-        // Fail closed: a danger-pass error or timeout must NOT fall through to a normal rebalance —
-        // that could re-expose a vault to an undetected danger. Skip this iteration and retry. The
-        // detector is constructed outside this loop, so its in-memory trigger baselines survive; a
-        // transient error does not blind the catastrophic triggers on the next pass (a full loop
-        // restart would, by reconstructing the detector from scratch).
-        logger.error(`[allocation-rebalance-loop] Danger detection failed; skipping rebalance this iteration: ${e}`);
-        if (await sleepUntilNextIteration()) {
-          return;
-        }
-        continue;
-      }
-
-      // Danger is scoped per-vault via a directive map: a vault just responded-to carries skip:true and
-      // exposes no rebalance sets (so it structurally cannot be rebalanced/re-exposed this pass); every
-      // other vault carries the final blacklist (force-zeroed) + cooldown reserves (excluded from new
-      // allocation) to rebalance with.
-      const { directiveByVault } = dangerResult;
-      // --- END DANGER DETECTION ---
-
-      // iterate to all allocations and read the supply farm tokens and the farm rewards if farm APY should be considered
-      let reservesSupplyFarms = new Set<Address>();
-      for (const allocation of allocationsConfig.allocationsConfig) {
-        const vaultEntries = allocation.vaults;
-        for (const vaultEntry of vaultEntries) {
-          // Yield for each vault entry to prevent blocking
-          await new Promise((resolve) => setImmediate(resolve));
-          heartbeat?.();
-          if (getIncludeReservesSupplyFarmRewardsApy(allocation, vaultEntry)) {
-            const vaultAddress = getVaultAddress(vaultEntry);
-            const kaminoVault = kaminoVaultsMap.get(address(vaultAddress))!;
-            const reservesInAllocStates = kaminoManager.getVaultReserves(await kaminoVault.getState());
-
-            for (const reserve of reservesInAllocStates) {
-              const reserveState = vaultsReservesMap.get(reserve);
-              // this if should always be true as we loaded the reserves above
-              if (reserveState) {
-                const farm = reserveState.state.farmCollateral;
-                if (farm !== DEFAULT_PUBLIC_KEY) {
-                  reservesSupplyFarms = reservesSupplyFarms.add(farm);
-                }
-              }
-            }
-          }
-        }
-      }
-
-      // Yield after processing farms
-      await new Promise((resolve) => setImmediate(resolve));
-      heartbeat?.();
-
-      if (reservesSupplyFarms.size > 0) {
-        const farmsList = Array.from(reservesSupplyFarms);
-        const farmsStates = await withTimeout(
-          fetchAllMaybeFarmState(c.getRpc(), farmsList),
-          RPC_REQUEST_TIMEOUT_MS,
-          '[allocation-rebalance-loop] fetch farm states'
-        );
-        // zip the farms states with the farms list
-        farmsStates.forEach((maybeFarmState, index) => {
-          if (maybeFarmState.exists) {
-            farmToFarmStateMap.set(farmsList[index], maybeFarmState.data);
-
-            // add reward tokens to the set of all tokens relevant for APY computation
-            maybeFarmState.data.rewardInfos.forEach((rewardInfo) => {
-              if (rewardInfo.token.mint !== DEFAULT_PUBLIC_KEY) {
-                allTokensMintsIncludingFarms.add(rewardInfo.token.mint);
-              }
-            });
-          }
-        });
-      }
-
-      // Yield after processing farms
-      await new Promise((resolve) => setImmediate(resolve));
-      heartbeat?.();
-
-      // read the prices for all the relevant tokens
-      const pricesMap = await getTokensBatchPrice(Array.from(allTokensMintsIncludingFarms));
-
-      // Yield after fetching prices
-      await new Promise((resolve) => setImmediate(resolve));
-      heartbeat?.();
-
-      // Clear temporary arrays to save memory
-      let processedVaults = 0;
-
-      for (const allocation of allocationsConfig.allocationsConfig) {
-        const vaultEntries = allocation.vaults;
-        const timestampInSeconds = Math.floor(Date.now() / 1000);
-        for (const vaultEntry of vaultEntries) {
-          processedVaults++;
-
-          // Yield for each vault entry processing
-          await new Promise((resolve) => setImmediate(resolve));
-          heartbeat?.();
-
-          // Force garbage collection every 10 processed vaults to prevent memory buildup
-          if (processedVaults % 10 === 0 && global.gc) {
-            global.gc();
-          }
-
-          // Handle different vault entry types
-          const vaultAddress = getVaultAddress(vaultEntry);
-          const vaultStrategy = getVaultStrategy(vaultEntry, allocation.strategy);
-          const shouldIncludeFarmRewards = getIncludeReservesSupplyFarmRewardsApy(allocation, vaultEntry);
-          logger.info(`[allocation-rebalance-loop] processing vault ${vaultAddress.toString()}`);
-
-          // Skip vaults the danger pass responded to (or could not assess): their directive carries no
-          // rebalance sets, so the type system prevents rebalancing them below. Rebalancing a
-          // just-responded vault could immediately re-expose it.
-          const dangerDirective = directiveByVault.get(vaultAddress);
-          if (!dangerDirective || dangerDirective.skip) {
-            logger.warn(
-              `[allocation-rebalance-loop] Skipping rebalance for vault ${vaultAddress} — danger response executed or vault not assessed this iteration`
-            );
-            continue;
-          }
-
-          let lastRebalanceTimestamp = 0;
-          if (lastRebalanceTimestampInSecondsPerVault.has(vaultAddress)) {
-            lastRebalanceTimestamp = lastRebalanceTimestampInSecondsPerVault.get(vaultAddress)!;
-          } else {
-            lastRebalanceTimestampInSecondsPerVault.set(vaultAddress, timestampInSeconds);
-          }
-          const rebalanceFrequencySeconds = getRebalanceFrequencySeconds(allocation, vaultEntry);
-          const shouldRebalance = timestampInSeconds - lastRebalanceTimestamp > rebalanceFrequencySeconds;
-
-          if (shouldRebalance || dryRun || getAllocationDryRun(allocation, vaultEntry)) {
-            recomputedVaultApy = true;
-            const kaminoVault = kaminoVaultsMap.get(address(vaultAddress))!;
-            const vaultState = await kaminoVault.getState();
-
-            // Yield before heavy rebalance operation
-            await new Promise((resolve) => setImmediate(resolve));
-
-            // Call rebalanceAllocation with the appropriate parameters based on vault type
-            const currentLedgerInstant = await withTimeout(
-              getCurrentLedgerInstant(kaminoManager.getRpc()),
-              RPC_REQUEST_TIMEOUT_MS,
-              `[allocation-rebalance-loop] get current ledger instant ${vaultAddress}`
-            );
-
-            // Extract fixed reserves weights for FIXED_WEIGHTS strategy
-            let fixedReservesWeights: ReserveWeight[] | undefined;
-            if (vaultStrategy === RebalanceStrategy.FIXED_WEIGHTS) {
-              fixedReservesWeights = getReserveWeights(vaultEntry) || undefined;
-            }
-            let rebalanceIxs: IInstruction[];
-            try {
-              if (typeof vaultEntry !== 'string') {
-                validateConfiguredReserveMembership(
-                  vaultAddress,
-                  getReserveAddresses(vaultEntry.fixedReserves),
-                  kaminoManager.getVaultReserves(vaultState)
-                );
-              }
-              rebalanceIxs = await rebalanceAllocation({
-                kaminoManager,
-                kaminoVault,
-                vaultsReserves,
-                strategy: vaultStrategy,
-                signer: allocationAdmin,
-                currentLedgerInstant,
-                gridSearchResolution,
-                shouldIncludeFarmRewards,
-                fixedReservesConfig: getFixedReservesWithConfig(vaultEntry),
-                fixedReservesWeights,
-                drippingRatePercent: getDrippingRatePercent(allocation, vaultEntry),
-                farmsToFarmStateMap: farmToFarmStateMap,
-                pricesMap,
-                verbose,
-                blacklistedReserves: dangerDirective.blacklistedReserves,
-                cooldownReserves: dangerDirective.cooldownReserves,
-                enforceUtilizationCap: getEnforceUtilizationCap(allocation, vaultEntry),
-                maxUtilizationChangeBps: getMaxUtilizationChangeBps(allocation, vaultEntry),
-              });
-            } catch (error) {
-              logger.error(`[allocation-rebalance-loop] error computing rebalance for vault ${vaultAddress}: ${error}`);
-              try {
-                rebalanceIxs = await buildBlacklistEnforcementIxs(
-                  kaminoManager,
-                  kaminoVault,
-                  vaultsReserves,
-                  allocationAdmin,
-                  dangerDirective.blacklistedReserves,
-                  dangerDirective.cooldownReserves
-                );
-              } catch (enforcementError) {
-                logger.error(
-                  `[allocation-rebalance-loop] could not build blacklist enforcement for vault ${vaultAddress}: ${enforcementError}`
-                );
-                continue;
-              }
-              if (rebalanceIxs.length === 0) {
-                continue;
-              }
-            }
-
-            if (dryRun || getAllocationDryRun(allocation, vaultEntry)) {
-              logger.info(`[allocation-rebalance-loop] Dry run rebalancing vault ${vaultAddress}`);
-              continue;
-            }
-
-            // Yield before transaction operations
-            await new Promise((resolve) => setImmediate(resolve));
-            heartbeat?.();
-
-            // batch every 2 ixs to avoid tx size limit
-            try {
-              logger.info(`[allocation-rebalance-loop] Send tx rebalancing vault ${vaultAddress}`);
-
-              const luts = [];
-              const hasLut = vaultState.vaultLookupTable !== DEFAULT_PUBLIC_KEY;
-              if (hasLut) {
-                const lutState = await withTimeout(
-                  getLut(c.getRpc(), vaultState.vaultLookupTable),
-                  RPC_REQUEST_TIMEOUT_MS,
-                  `[allocation-rebalance-loop] get lut ${vaultState.vaultLookupTable}`
-                );
-                luts.push(lutState);
-              }
-              const batchSize = 2;
-              await sendInstructionBatches({
-                connectionPool: c,
-                payer: allocationAdmin,
-                instructions: rebalanceIxs,
-                lookupTables: luts,
-                signers: [allocationAdmin],
-                description: `allocation-rebalance-loop update weight allocation vault ${vaultAddress}`,
-                batchSize,
-                options: { reportSample: true },
-                heartbeat,
-              });
-              // Update the last rebalance timestamp after successful rebalance
-              lastRebalanceTimestampInSecondsPerVault.set(vaultAddress, timestampInSeconds);
-
-              // after we updated the allocation we need to invest so the assets are matching the allocation
-              if (await heartbeatSleepSeconds(5, heartbeat)) {
-                return;
-              }
-              await withTimeout(
-                kaminoVault.reloadState(),
-                RPC_REQUEST_TIMEOUT_MS,
-                `[allocation-rebalance-loop] reload vault ${vaultAddress}`
-              );
-              const investLedgerInstant = await withTimeout(
-                getCurrentLedgerInstant(kaminoManager.getRpc()),
-                RPC_REQUEST_TIMEOUT_MS,
-                `[allocation-rebalance-loop] get invest ledger instant ${vaultAddress}`
-              );
-              const investIxs = await withTimeout(
-                kaminoManager.investAllReservesIxs(allocationAdmin, kaminoVault, investLedgerInstant),
-                RPC_REQUEST_TIMEOUT_MS,
-                `[allocation-rebalance-loop] build invest instructions ${vaultAddress}`
-              );
-              await sendInstructionBatches({
-                connectionPool: c,
-                payer: allocationAdmin,
-                instructions: investIxs,
-                lookupTables: luts,
-                signers: [allocationAdmin],
-                description: `allocation-rebalance-loop invest after weight update vault ${vaultAddress}`,
-                batchSize,
-                options: { reportSample: true },
-                heartbeat,
-              });
-            } catch (e) {
-              logger.error(`[allocation-rebalance-loop] error rebalancing vault ${vaultAddress}: ${e}`);
-              continue;
-            }
-          }
-        }
-      }
-
-      // Yield before cleanup
-      await new Promise((resolve) => setImmediate(resolve));
-      heartbeat?.();
-
-      // Clear memory-intensive objects before sleeping to prevent memory leaks
-      allTokensMintsIncludingFarms.clear();
-      farmToFarmStateMap.clear();
-
-      // Force garbage collection after clearing large objects
-      if (global.gc) {
-        global.gc();
-      }
-
-      await kaminoManagerRefreshCoordinator?.completeWorkCycle(recomputedVaultApy);
-
+        )
+    );
+    if (!dangerPasses.record(dangerResult) || dangerResult === undefined) {
+      // Fail closed: a danger-pass error or timeout must NOT fall through to a normal rebalance —
+      // that could re-expose a vault to an undetected danger. Skip this iteration and retry. The
+      // detector is constructed outside this loop, so its in-memory trigger baselines survive; a
+      // transient error does not blind the catastrophic triggers on the next pass (a full loop
+      // restart would, by reconstructing the detector from scratch).
       if (await sleepUntilNextIteration()) {
         return;
       }
+      continue;
+    }
+
+    // Danger is scoped per-vault via a directive map: a vault just responded-to carries skip:true and
+    // exposes no rebalance sets (so it structurally cannot be rebalanced/re-exposed this pass); every
+    // other vault carries the final blacklist (force-zeroed) + cooldown reserves (excluded from new
+    // allocation) to rebalance with.
+    const { directiveByVault } = dangerResult;
+    // The first pass that assesses a vault is the checkpoint from which idle waits beat the heartbeat.
+    hasOperationalCheckpoint = true;
+    onNoNewFundsReserves?.(Array.from(dangerResult.noNewFundsReserves));
+    // Freeze excluded reserves at current holdings to block deposits from any cranker. Restore caps after recovery.
+    const staleVaults = await attempt('[allocation-rebalance-loop] error reconciling deposit freezes', () =>
+      reconcileDepositFreezes({
+        connectionPool: c,
+        kaminoManager,
+        allocationAdmin,
+        blacklistPath: envConfig.blacklistPath,
+        kaminoVaults: depositFreezeVaults(allocationsConfig, directiveByVault, kaminoVaultsMap, dryRun),
+        noNewFundsReserves: dangerResult.noNewFundsReserves,
+        vaultsReserves,
+        heartbeat,
+      })
+    );
+    // A vault whose caps changed but whose state could not be reloaded would get its old caps back from a weight update.
+    for (const vaultAddress of staleVaults ?? []) {
+      kaminoVaultsMap.delete(vaultAddress);
+    }
+    // --- END DANGER DETECTION ---
+
+    await checkAdminVaultTokenBalances(c, allocationAdmin, vaultStates);
+    const dueVaults = await selectDueVaults({
+      allocationsConfig,
+      directiveByVault,
+      kaminoVaultsMap,
+      vaultsReserves,
+      kaminoManager,
+      rebalanceSchedule,
+      allocationAdmin: allocationAdmin.address,
+      globalDryRun: dryRun,
+      heartbeat,
+    });
+
+    // Prices and farm states feed only farm-reward APY, so they are read only for due vaults that count some.
+    const farmVaults = dueVaults.filter((dueVault) => dueVault.farms.length > 0);
+    const farmData: FarmData | undefined =
+      farmVaults.length > 0
+        ? await fetchFarmData(
+            c,
+            Array.from(new Set(farmVaults.flatMap((dueVault) => dueVault.farms))),
+            Array.from(new Set(farmVaults.map((dueVault) => dueVault.tokenMint)))
+          )
+        : { farmToFarmStateMap: new Map(), pricesMap: new Map() };
+
+    // Yield after fetching prices
+    await yieldAndBeat(heartbeat);
+
+    if (
+      (await rebalanceDueVaults(dueVaults, {
+        connectionPool: c,
+        kaminoManager,
+        allocationAdmin,
+        vaultsReserves,
+        farmData,
+        envConfig,
+        gridSearchBudget,
+        rebalanceSchedule,
+        reserveInvestCooldowns,
+        heartbeat,
+      })) === 'shutdown'
+    ) {
+      return;
+    }
+    const recomputedVaultApy = dueVaults.length > 0;
+
+    // Yield before cleanup
+    await yieldAndBeat(heartbeat);
+
+    // Force garbage collection after clearing large objects
+    if (global.gc) {
+      global.gc();
+    }
+
+    heartbeat?.('pass-completed');
+    await kaminoManagerRefreshCoordinator.completeWorkCycle(recomputedVaultApy);
+
+    if (await sleepUntilNextIteration()) {
+      return;
     }
   }
+}
+
+/** The configured vault addresses and the smallest rebalance frequency. Logs each entry's vaults and frequency. */
+function summarizeAllocations(allocationsConfig: AllocationsConfig): {
+  vaultAddresses: Address[];
+  minRebalanceFrequencySeconds: number;
+} {
+  let minRebalanceFrequencySeconds = Number.MAX_VALUE;
+  const vaultAddresses: Address[] = [];
+  for (const allocation of allocationsConfig.allocationsConfig) {
+    for (const vaultEntry of allocation.vaults) {
+      vaultAddresses.push(address(getVaultAddress(vaultEntry)));
+      minRebalanceFrequencySeconds = Math.min(
+        minRebalanceFrequencySeconds,
+        getRebalanceFrequencySeconds(allocation, vaultEntry)
+      );
+    }
+  }
+  for (const allocation of allocationsConfig.allocationsConfig) {
+    logger.info(
+      `[allocation-rebalance-loop] ${allocation.strategy}: ${allocation.vaults
+        .map((vault) => getVaultAddress(vault))
+        .join(', ')} rebalance frequency: ${getRebalanceFrequencySeconds(allocation, allocation.vaults[0])} seconds`
+    );
+  }
+  return { vaultAddresses, minRebalanceFrequencySeconds };
+}
+
+/**
+ * Reads the states and reserves of the loaded vaults. A vault with a reserve that failed to load cannot be assessed or
+ * rebalanced this pass: it is removed from `kaminoVaultsMap`, which keeps it out of the danger pass and, having no
+ * directive, out of the rebalance.
+ */
+async function loadPassReserves(
+  kaminoManager: KaminoManager,
+  kaminoVaultsMap: Map<Address, KaminoVault>,
+  idleHeartbeat: LoopHeartbeat | undefined,
+  heartbeat: LoopHeartbeat | undefined
+): Promise<{ vaultStates: VaultState[]; vaultsReserves: Map<Address, KaminoReserve> }> {
+  // this should not do any RPC call, the vaults are read already above but getState is async as it reads the state if not already fetched
+  const vaultStates = await Promise.all(
+    Array.from(kaminoVaultsMap.values()).map((kaminoVault) => kaminoVault.getState())
+  );
+
+  // Yield after processing vault states
+  await yieldAndBeat(idleHeartbeat);
+
+  // load the reserves for all vaults
+  const vaultsReserves = await loadVaultsReservesInBatches(
+    kaminoManager,
+    vaultStates,
+    '[allocation-rebalance-loop] load vault reserves',
+    // Progress through the first load counts: the startup probe must not kill a slow first pass.
+    heartbeat
+  );
+  const vaultStatesByAddress = new Map(
+    Array.from(kaminoVaultsMap.keys(), (vaultAddress, index) => [vaultAddress, vaultStates[index]] as const)
+  );
+  for (const [vaultAddress, vaultState] of vaultStatesByAddress) {
+    const missingReserves = getMissingVaultReserves(kaminoManager.getVaultReserves(vaultState), vaultsReserves);
+    if (missingReserves.length > 0) {
+      logger.error(
+        `[allocation-rebalance-loop] skipping vault ${vaultAddress} this pass: ${missingReserves.length} reserve(s) failed to load: ${missingReserves.join(', ')}`
+      );
+      kaminoVaultsMap.delete(vaultAddress);
+    }
+  }
+  return { vaultStates, vaultsReserves };
+}
+
+/** What `rebalanceDueVaults` needs besides the due vaults. */
+interface DueVaultRebalanceInputs {
+  connectionPool: ConnectionPool;
+  kaminoManager: KaminoManager;
+  allocationAdmin: KeyPairSigner;
+  vaultsReserves: Map<Address, KaminoReserve>;
+  farmData: FarmData | undefined;
+  envConfig: AllocationLoopConfig;
+  gridSearchBudget: GridSearchBudget;
+  rebalanceSchedule: VaultRebalanceSchedule;
+  reserveInvestCooldowns: ReserveInvestCooldowns;
+  heartbeat: LoopHeartbeat | undefined;
+}
+
+/** Computes and sends each due vault's rebalance and records its outcome. Returns 'shutdown' when a shutdown starts. */
+async function rebalanceDueVaults(
+  dueVaults: DueVault[],
+  {
+    connectionPool: c,
+    kaminoManager,
+    allocationAdmin,
+    vaultsReserves,
+    farmData,
+    envConfig,
+    gridSearchBudget,
+    rebalanceSchedule,
+    reserveInvestCooldowns,
+    heartbeat,
+  }: DueVaultRebalanceInputs
+): Promise<'shutdown' | undefined> {
+  let processedVaults = 0;
+  for (const dueVault of dueVaults) {
+    processedVaults++;
+
+    // Yield for each vault entry processing
+    await yieldAndBeat(heartbeat);
+
+    // Force garbage collection every 10 processed vaults to prevent memory buildup
+    if (processedVaults % 10 === 0 && global.gc) {
+      global.gc();
+    }
+
+    const { allocation, vaultEntry, vaultAddress, kaminoVault } = dueVault;
+    const rebalance = await computeVaultRebalanceIxs({
+      kaminoManager,
+      kaminoVault,
+      allocation,
+      vaultEntry,
+      allocationAdmin,
+      vaultsReserves,
+      directive: dueVault.directive,
+      includeFarmRewards: dueVault.includeFarmRewards,
+      needsFarmData: dueVault.farms.length > 0,
+      farmData,
+      gridSearchResolution: envConfig.gridSearchResolution,
+      gridSearchBudget,
+      verbose: envConfig.verbose,
+      heartbeat,
+    });
+    if (rebalance === undefined) {
+      continue;
+    }
+    const rebalanceFrequencySeconds = getRebalanceFrequencySeconds(allocation, vaultEntry);
+    // A failed strategy still sends blacklist enforcement. Rejected limits block normal investment and remain retryable.
+    const outcome = await sendVaultRebalance({
+      connectionPool: c,
+      kaminoManager,
+      kaminoVault,
+      vaultState: rebalance.vaultState,
+      allocationAdmin,
+      ixs: rebalance.ixs,
+      investAllowed: rebalance.investAllowed,
+      blacklistedReserves: dueVault.directive.blacklistedReserves,
+      noNewFundsReserves: dueVault.directive.cooldownReserves,
+      vaultsReserves,
+      dryRun: dueVault.vaultDryRun,
+      getUtilizationCap: () =>
+        envConfig.allocationConfigPath
+          ? readInvestUtilizationCaps(envConfig.allocationConfigPath).get(kaminoVault.address)
+          : getInvestUtilizationCap(allocation, vaultEntry),
+      reserveInvestCooldowns,
+      heartbeat,
+    });
+    if (isRebalanceDone(outcome, rebalance.strategyFailed)) {
+      rebalanceSchedule.recordDone(vaultAddress);
+    } else {
+      rebalanceSchedule.recordFailure(vaultAddress, rebalanceFrequencySeconds);
+    }
+    if (isProcessShuttingDown()) {
+      return 'shutdown';
+    }
+  }
+  return undefined;
+}
+
+/**
+ * Milliseconds between two allocation passes: the smallest of the danger pass interval, the smallest rebalance
+ * frequency, and the time until the next KaminoManager refresh when the loop refreshes it.
+ */
+export function getAllocationPassSleepMs(
+  minRebalanceFrequencySeconds: number,
+  dangerPassIntervalSeconds: number,
+  millisecondsUntilRefresh: number | undefined
+): number {
+  const sleepMilliseconds = Math.min(minRebalanceFrequencySeconds, dangerPassIntervalSeconds) * 1000;
+  return millisecondsUntilRefresh === undefined
+    ? sleepMilliseconds
+    : Math.min(sleepMilliseconds, millisecondsUntilRefresh);
+}
+
+/**
+ * Counts consecutive failed danger passes. A pass that assesses no configured vault also counts as failed.
+ */
+export class DangerPassTracker {
+  private consecutiveFailures = 0;
+  private lastSuccessAtMs: number | undefined;
+  /** The failing state last reported; undefined before the first report. */
+  private reportedFailing: boolean | undefined;
+
+  constructor(
+    private readonly nowMs: () => number = Date.now,
+    /**
+     * Updates readiness after repeated failures and recovery, including the first success after a worker restart.
+     */
+    private readonly onFailingChange?: (failing: boolean) => void
+  ) {}
+
+  /** Records a pass, logs the escalation when it is due, and returns whether the pass assessed a vault. */
+  record(result: DangerAssessmentResult | undefined): boolean {
+    if (result !== undefined && result.directiveByVault.size > 0) {
+      this.consecutiveFailures = 0;
+      this.lastSuccessAtMs = this.nowMs();
+      this.report(false);
+      return true;
+    }
+    this.consecutiveFailures++;
+    const escalation = describeDangerPassFailures(this.consecutiveFailures, this.lastSuccessAtMs, this.nowMs());
+    if (escalation !== undefined) {
+      logger.error(escalation);
+      this.report(true);
+    }
+    return false;
+  }
+
+  private report(failing: boolean): void {
+    if (this.reportedFailing === failing) return;
+    this.reportedFailing = failing;
+    this.onFailingChange?.(failing);
+  }
+}
+
+/** Failed danger passes in a row from which the loop logs an escalation on every further failure. */
+export const DANGER_FAILURE_ESCALATION_PASSES = 3;
+
+/** The escalation line for failed danger passes in a row; undefined below DANGER_FAILURE_ESCALATION_PASSES. */
+export function describeDangerPassFailures(
+  consecutiveFailures: number,
+  lastSuccessAtMs: number | undefined,
+  nowMs: number
+): string | undefined {
+  if (consecutiveFailures < DANGER_FAILURE_ESCALATION_PASSES) {
+    return undefined;
+  }
+  const lastSuccess =
+    lastSuccessAtMs === undefined
+      ? 'none has succeeded since the loop started'
+      : `the last one succeeded ${Math.round((nowMs - lastSuccessAtMs) / 60_000)} min ago`;
+  return `[allocation-rebalance-loop] danger detection failed ${consecutiveFailures} passes in a row; ${lastSuccess}. No vault is assessed or rebalanced until it succeeds`;
 }
