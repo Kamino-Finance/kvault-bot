@@ -120,6 +120,11 @@ export interface SendTransactionOptions {
   sendIfSimulationFailed?: boolean;
   /** Optional final-preflight guard for callers that force only selected simulation failures. */
   shouldSendAfterSimulationFailure?: (error: SimulateTransactionError) => boolean;
+  /**
+   * Called with the blockhash of each signed transaction, re-signed retries included, before the transaction leaves the
+   * process. When it throws, that transaction is not sent and the call rejects with its error.
+   */
+  onBlockhash?: (blockhash: BlockhashWithHeight) => void;
 }
 
 export async function sendAndConfirmTransactionV0(
@@ -136,6 +141,7 @@ export async function sendAndConfirmTransactionV0(
     reportSample = true,
     sendIfSimulationFailed = false,
     shouldSendAfterSimulationFailure,
+    onBlockhash,
   } = options;
   const [cu, fetchedBlockhash, fee] = await Promise.all([
     c.shouldSimulate()
@@ -191,9 +197,8 @@ export async function sendAndConfirmTransactionV0(
       blockhash = await fetchBlockhash(c.getRpc() as Rpc<GetLatestBlockhashApi>);
     }
 
-    // Use one signed payload per attempt. Previously MULTICAST_JITO sent both the normal transaction
-    // and a separately-signed tipped transaction, so both could execute. A tipped send is now
-    // mutually exclusive and follows the same confirmation/retry path as a normal send.
+    // Use one signed payload per attempt, so a normal and a tipped transaction can never both execute.
+    // A tipped send follows the same confirmation/retry path as a normal send.
     const transactionIxs = getTransactionInstructions(ixs, payer, c.shouldMulticastJito());
     const tx = await buildSignedTx(payer, transactionIxs, lookupTables, signers, blockhash);
 
@@ -205,6 +210,7 @@ export async function sendAndConfirmTransactionV0(
       simulationError,
       shouldSendAfterSimulationFailure
     );
+    onBlockhash?.(blockhash);
 
     if (reportSample) {
       // Only after the send decision: the collector receives signed bytes of transactions the bot sends.

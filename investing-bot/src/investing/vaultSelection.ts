@@ -12,8 +12,9 @@ const VAULT_FETCH_BATCH_SIZE = 25;
 
 /**
  * Returns the vault pubkeys to pass to getVaultsData: the configured ones, followed by the UI-enabled ones when
- * `includeUiVaults` is set. Returns undefined when the UI list fails to load and nothing is configured, so the
- * caller skips the pass instead of letting an empty selection widen the universe.
+ * `includeUiVaults` is set. With `includeUiVaults` set, returns undefined when the selection is empty and no owner is
+ * configured, whether the UI list failed to load or was empty. The caller then skips the pass instead of letting an
+ * empty selection widen the universe.
  */
 export async function selectVaultPubkeys(
   baseVaultsPubkeys: Address[],
@@ -24,21 +25,22 @@ export async function selectVaultPubkeys(
   if (!includeUiVaults) {
     return baseVaultsPubkeys;
   }
+  let uiEnabledVaults: Address[] = [];
   try {
-    const uiEnabledVaults = await fetchUiEnabledVaults();
-    return [...baseVaultsPubkeys, ...uiEnabledVaults];
+    uiEnabledVaults = await fetchUiEnabledVaults();
   } catch (e) {
     // A CDN outage must not stop the configured vaults; the UI list is retried next pass.
     logger.error(
       `[investing-loop] could not load the UI-enabled vault list; investing only the configured vaults this pass: ${e}`
     );
-    if (baseVaultsPubkeys.length === 0 && vaultOwnersPubkeys.length === 0) {
-      // An empty selection means "every vault" to getVaultsData: an outage must never widen the universe.
-      logger.error('[investing-loop] no explicitly configured vaults to fall back to; skipping this pass');
-      return undefined;
-    }
-    return baseVaultsPubkeys;
   }
+  const selectedVaultsPubkeys = [...baseVaultsPubkeys, ...uiEnabledVaults];
+  if (selectedVaultsPubkeys.length === 0 && vaultOwnersPubkeys.length === 0) {
+    // An empty selection means "every vault" to getVaultsData: the UI list must never widen the universe.
+    logger.error('[investing-loop] no UI-enabled or configured vault to invest; skipping this pass');
+    return undefined;
+  }
+  return selectedVaultsPubkeys;
 }
 
 export async function getVaultsData(

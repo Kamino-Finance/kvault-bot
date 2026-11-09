@@ -21,6 +21,7 @@ import {
   failedOutsideInstructions,
   failureCanFollowMissingWithdrawalProceeds,
   isInvestAmountBelowMinimumFailure,
+  isPayerRoundingShortfall,
   isReserveAttributableFailure,
 } from './programFailure.js';
 import { planReserveInstructions, ReserveIx, sendReserveBatches } from './reserveBatches.js';
@@ -190,7 +191,12 @@ export async function sendInvestIxsPerReserve({
   const recordProgramFailure = (reserveIx: ReserveIx, error: unknown): void => {
     const hasEarlierMissingInstruction =
       earliestMissingOrdinal !== undefined && earliestMissingOrdinal < reserveIx.ordinal;
-    if (
+    if (isPayerRoundingShortfall(error, kvaultsProgramId)) {
+      // A payer funding problem: the next pass retries the reserve, after crank funding tops the payer up.
+      logger.error(
+        `${logPrefix} vault ${vaultAddress}: payer ${payer.address} holds too few vault tokens to pay the rounding loss of the invest into reserve ${reserveIx.reserve}; no reserve cooldown`
+      );
+    } else if (
       !isInvestAmountBelowMinimumFailure(error, kvaultsProgramId) &&
       (!hasEarlierMissingInstruction || !failureCanFollowMissingWithdrawalProceeds(error, kvaultsProgramId))
     ) {

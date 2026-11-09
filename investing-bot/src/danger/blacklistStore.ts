@@ -65,6 +65,20 @@ function validateDepositFreeze(entry: unknown, prefix: string): void {
       throw corrupt(`.${field} must be a non-negative integer string.`);
     }
   }
+  const unresolvedCaps = entry.unresolvedCaps;
+  const isIntegerString = (value: unknown) => typeof value === 'string' && /^\d+$/.test(value);
+  if (
+    unresolvedCaps !== undefined &&
+    (!Array.isArray(unresolvedCaps) ||
+      !unresolvedCaps.every(
+        (sent) =>
+          isNonNullObject(sent) && isIntegerString(sent.capLamports) && isIntegerString(sent.expiresAtBlockHeight)
+      ))
+  ) {
+    throw corrupt(
+      '.unresolvedCaps must be an array of objects with non-negative integer strings capLamports and expiresAtBlockHeight.'
+    );
+  }
   if (!isNonEmptyString(entry.timestamp) || Number.isNaN(Date.parse(entry.timestamp))) {
     throw corrupt('.timestamp must be a valid timestamp string.');
   }

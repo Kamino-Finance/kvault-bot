@@ -352,7 +352,7 @@ export const SETTINGS = defineSettings({
     default: 3600,
     usedBy: ['danger'],
     description:
-      'Scope price age limit L, in seconds. A zero or near-zero price is as old as the longer of its publish age and the time it has read zero. Safety score: 0.4 past L, 0.2 past 2L and 0 past 4L. A positive integer.',
+      'Scope publish age limit L, in seconds, including for zero or near-zero prices. Fresh zeros block deposits. Their duration alone does not trigger evacuation. Market collateral is the exception: its zero is as old as the longer of its publish age and the time it has read zero. Safety score: 0.4 past L, 0.2 past 2L and 0 past 4L. A positive integer.',
     validate: positiveSafeInteger,
   },
   REINVEST_COOLDOWN_SECONDS: {

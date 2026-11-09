@@ -338,8 +338,7 @@ export function redistributeWeightDifferenceWithinBounds(
   // infeasible path below and the feasible path, so a caller that ignores `isFeasible` can never emit
   // a weight above a reserve's deposit cap or below its withdrawal floor: the returned allocation
   // always respects the bounds, and `isFeasible` reports only whether the exact target total was also
-  // reachable within them. (Previously the infeasible target case returned the raw, unclamped input,
-  // which could carry an over-cap weight straight through to a caller.)
+  // reachable within them.
   const boundedAllocation = new Map<Address, Decimal>();
   for (const [reserve, weight] of adjustedAllocation) {
     const bounds = effectiveBounds.get(reserve)!;
