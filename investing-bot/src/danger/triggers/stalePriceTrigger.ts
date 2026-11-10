@@ -4,8 +4,16 @@ import { CollateralReserve, CollateralTrigger, DangerTrigger, TriggerContext, Tr
 import { StagedObservations } from '../observationStaging.js';
 
 /**
+ * The reserves a StalePriceTrigger checks. A vault reserve's own zero price is a pause and ages by its publish time only.
+ * Market collateral that reads zero can stop liquidations in its market. The vault reserve can still exit, so a
+ * collateral zero also ages by how long it has read zero.
+ */
+export type StalePriceRole = 'vaultReserve' | 'marketCollateral';
+
+/**
  * Scores Scope age against MAX_STALE_PRICE_DURATION_SECONDS: 0.4 past the limit, 0.2 past twice it, 0 past four times it.
- * Zero and near-zero prices use the greater of publish age and observed zero duration. Skips reserves without Scope pricing.
+ * For market collateral, zero and near-zero prices use the greater of publish age and observed zero duration. Skips
+ * reserves without Scope pricing.
  */
 export class StalePriceTrigger implements DangerTrigger, CollateralTrigger {
   readonly name = 'stale-price';
@@ -17,6 +25,8 @@ export class StalePriceTrigger implements DangerTrigger, CollateralTrigger {
    */
   private readonly pendingZeroPriceSince = new StagedObservations<{ since: bigint | undefined }>();
 
+  constructor(private readonly role: StalePriceRole) {}
+
   async check(
     _rpc: Rpc<SolanaRpcApi>,
     reserveAddress: Address,
@@ -26,8 +36,9 @@ export class StalePriceTrigger implements DangerTrigger, CollateralTrigger {
     const observation = context.scopeOracleObservations?.get(reserveAddress);
     const limitSeconds = context.maxStalePriceDurationSeconds;
     const reserveKey = reserveAddress.toString();
+    const agesZeroByDuration = this.role === 'marketCollateral';
     // Only a normal price ends a zero; an unreadable pass leaves the clock as it is.
-    if (observation?.kind === 'healthy' || observation?.kind === 'notConfigured') {
+    if (agesZeroByDuration && (observation?.kind === 'healthy' || observation?.kind === 'notConfigured')) {
       this.stageClock(context, reserveKey, undefined);
     }
     if (limitSeconds === undefined || (observation?.kind !== 'healthy' && observation?.kind !== 'zero')) {
@@ -35,7 +46,7 @@ export class StalePriceTrigger implements DangerTrigger, CollateralTrigger {
     }
     let ageSeconds = Number(observation.ageSeconds);
     let zeroDetails = '';
-    if (observation.kind === 'zero') {
+    if (agesZeroByDuration && observation.kind === 'zero') {
       const nowSeconds = BigInt(context.currentLedgerInstant.blockTime);
       const zeroSince = this.zeroPriceSinceByReserve.get(reserveKey) ?? nowSeconds;
       this.stageClock(context, reserveKey, zeroSince);

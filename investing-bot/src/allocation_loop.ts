@@ -188,7 +188,7 @@ export async function runAllocationPasses(
     if (kaminoVaultsMap.size === 0) {
       // Nothing loaded: no vault gets a danger pass, which counts as a failed one. Sleep a while and try again. Before the
       // first assessed pass this stall sends no heartbeat, so a bot that has never worked is not reported healthy.
-      dangerPasses.record(undefined);
+      dangerPasses.record(undefined, allVaultsAddresses);
       if (await sleep(10_000, hasOperationalCheckpoint ? heartbeat : undefined)) {
         return;
       }
@@ -218,7 +218,7 @@ export async function runAllocationPasses(
           '[allocation-rebalance-loop] danger detection pass'
         )
     );
-    if (!dangerPasses.record(dangerResult) || dangerResult === undefined) {
+    if (!dangerPasses.record(dangerResult, allVaultsAddresses) || dangerResult === undefined) {
       // Fail closed: a danger-pass error or timeout must NOT fall through to a normal rebalance —
       // that could re-expose a vault to an undetected danger. Skip this iteration and retry. The
       // detector is constructed outside this loop, so its in-memory trigger baselines survive; a
@@ -498,11 +498,14 @@ export function getAllocationPassSleepMs(
 }
 
 /**
- * Counts consecutive failed danger passes. A pass that assesses no configured vault also counts as failed.
+ * Counts consecutive failed danger passes, and for each configured vault the passes in a row that did not assess it. A
+ * pass that assesses no configured vault counts as failed. Only failed passes change readiness: with the liveness probe
+ * on /health, not ready restarts the pod, and a restart does not repair one vault.
  */
 export class DangerPassTracker {
   private consecutiveFailures = 0;
   private lastSuccessAtMs: number | undefined;
+  private readonly unassessedPassesByVault = new Map<string, number>();
   /** The failing state last reported; undefined before the first report. */
   private reportedFailing: boolean | undefined;
 
@@ -514,21 +517,44 @@ export class DangerPassTracker {
     private readonly onFailingChange?: (failing: boolean) => void
   ) {}
 
-  /** Records a pass, logs the escalation when it is due, and returns whether the pass assessed a vault. */
-  record(result: DangerAssessmentResult | undefined): boolean {
-    if (result !== undefined && result.directiveByVault.size > 0) {
+  /**
+   * Records a pass over `configuredVaults`, logs the escalations that are due, and returns whether the pass assessed a
+   * vault. Danger monitoring is failing from DANGER_FAILURE_ESCALATION_PASSES failed passes in a row. A configured vault
+   * that has gone that many passes in a row without an assessment is logged on every pass.
+   */
+  record(result: DangerAssessmentResult | undefined, configuredVaults: readonly string[]): boolean {
+    const assessedVaults = result?.assessedVaults ?? new Set<string>();
+    for (const vault of configuredVaults) {
+      this.unassessedPassesByVault.set(
+        vault,
+        assessedVaults.has(vault) ? 0 : (this.unassessedPassesByVault.get(vault) ?? 0) + 1
+      );
+    }
+    const passSucceeded = assessedVaults.size > 0;
+    if (passSucceeded) {
       this.consecutiveFailures = 0;
       this.lastSuccessAtMs = this.nowMs();
-      this.report(false);
-      return true;
+    } else {
+      this.consecutiveFailures++;
+      const escalation = describeDangerPassFailures(this.consecutiveFailures, this.lastSuccessAtMs, this.nowMs());
+      if (escalation !== undefined) logger.error(escalation);
     }
-    this.consecutiveFailures++;
-    const escalation = describeDangerPassFailures(this.consecutiveFailures, this.lastSuccessAtMs, this.nowMs());
-    if (escalation !== undefined) {
-      logger.error(escalation);
+    const unassessedVaults = configuredVaults.filter(
+      (vault) => (this.unassessedPassesByVault.get(vault) ?? 0) >= DANGER_FAILURE_ESCALATION_PASSES
+    );
+    if (passSucceeded && unassessedVaults.length > 0) {
+      logger.error(
+        `[allocation-rebalance-loop] ${unassessedVaults.length} configured vault(s) got no danger assessment in ${DANGER_FAILURE_ESCALATION_PASSES} or more passes in a row and are not rebalanced until one succeeds: ${unassessedVaults
+          .map((vault) => `${vault} (${this.unassessedPassesByVault.get(vault)} passes)`)
+          .join(', ')}`
+      );
+    }
+    if (this.consecutiveFailures >= DANGER_FAILURE_ESCALATION_PASSES) {
       this.report(true);
+    } else if (passSucceeded) {
+      this.report(false);
     }
-    return false;
+    return passSucceeded;
   }
 
   private report(failing: boolean): void {

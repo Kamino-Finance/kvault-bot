@@ -187,8 +187,17 @@ export interface PendingEvacuationEntry extends BlacklistEntry {
   vault: string;
 }
 
+/** A cap the bot sent to a frozen reserve and has not seen land. */
+export interface UnresolvedCapUpdate {
+  /** The cap sent, in vault-token lamports. */
+  capLamports: string;
+  /** The last valid block height of the send's latest transaction: after it, the send cannot land. */
+  expiresAtBlockHeight: string;
+}
+
 /**
- * Records a deposit freeze at the vault's holding. Recovery restores the original cap unless an operator changed it.
+ * Records a deposit freeze at the vault's holding. Recovery restores the original cap unless an operator changed it. The
+ * cap on chain is the bot's only when it equals the frozen cap or an unresolved cap.
  */
 export interface DepositFreezeEntry {
   vault: string;
@@ -197,6 +206,12 @@ export interface DepositFreezeEntry {
   originalCapLamports: string;
   /** The cap the freeze set, the vault's holding at the time, in vault-token lamports. */
   frozenCapLamports: string;
+  /**
+   * The freeze and lower caps the bot sent and has not seen confirmed, one entry per send. Each is saved before its
+   * transaction leaves the process and leaves when that send is confirmed or expires. A cap on chain that equals one is the frozen cap, but resolves no
+   * send: another send of the same cap can still land. The bot does not end a freeze while one is left.
+   */
+  unresolvedCaps?: UnresolvedCapUpdate[];
   timestamp: string; // ISO 8601
 }
 

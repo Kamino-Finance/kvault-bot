@@ -57,7 +57,7 @@ export type VaultRebalanceDirective =
 
 /**
  * Outcome of one danger-detection pass: a per-vault directive. Danger is scoped per vault rather than
- * as a single global verdict, so one dangerous vault no longer stalls the rebalance of every healthy
+ * as a single global verdict, so one dangerous vault does not stall the rebalance of every healthy
  * vault. A vault danger detection could not assess is simply absent from the map (the loop skips it).
  */
 export interface DangerAssessmentResult {
@@ -67,7 +67,15 @@ export interface DangerAssessmentResult {
    * directives carry the same set as their cooldown reserves.
    */
   readonly noNewFundsReserves: ReadonlySet<string>;
+  /**
+   * The vaults whose reserves this pass scored. A configured vault missing here got no assessment: it did not load, an
+   * earlier response for it was still running, or the pass could not read its assessment inputs.
+   */
+  readonly assessedVaults: ReadonlySet<string>;
 }
+
+/** Waits in milliseconds before the two retries of a danger pass's KSwap price fetch. */
+export const DANGER_PRICE_RETRY_DELAYS_MS: readonly number[] = [1_000, 2_000];
 
 /**
  * Coordinates the safety-critical danger-detection flow for the allocation loop: detection,
@@ -91,6 +99,8 @@ export interface DangerCoordinatorDeps {
   loadMarketCollateral?: typeof loadMarketCollateral;
   /** The klend program that owns the markets' reserves. */
   klendProgramId?: Address;
+  /** Waits before the retries of the price fetch; defaults to DANGER_PRICE_RETRY_DELAYS_MS. */
+  priceRetryDelaysMs?: readonly number[];
 }
 
 /** Thrown once a newer pass has started; detectAndRespond catches it in one place and abandons the pass. */
@@ -115,12 +125,22 @@ interface ResponsePass {
 /** The state one danger pass shares across its vaults. The sets grow in place as the pass responds. */
 interface DangerPass extends ResponsePass {
   readonly dryRun: boolean;
-  readonly dangerContext: TriggerContext;
-  readonly reserveAssessments: Map<Address, ReserveRiskAssessment>;
   readonly blacklistedReserves: Set<string>;
   readonly cooldownReserves: Set<string>;
   readonly clearDirective: VaultRebalanceDirective;
   readonly directiveByVault: Map<string, VaultRebalanceDirective>;
+  readonly assessedVaults: Set<string>;
+  /**
+   * The reserve scores of the pass. Undefined when an assessment input was unavailable: the pass then assesses and
+   * rebalances no vault, and only retries pending evacuations and enforces the blacklist.
+   */
+  readonly assessment: PassAssessment | undefined;
+}
+
+/** The trigger context and reserve scores of a pass, with the observations it may commit. */
+interface PassAssessment {
+  readonly dangerContext: TriggerContext;
+  readonly reserveAssessments: Map<Address, ReserveRiskAssessment>;
   readonly observationsToCommit: Set<string>;
   readonly assessedReserves: Set<string>;
   readonly marketCollateral: MarketCollateralSnapshot;
@@ -157,6 +177,7 @@ export class DangerCoordinator {
   private readonly klendProgramId: Address;
   private readonly marketPriceMaxAgeSeconds: number;
   private readonly maxStalePriceDurationSeconds: number;
+  private readonly priceRetryDelaysMs: readonly number[];
   private readonly intervalTimers: IntervalTimers | undefined;
   private readonly deinvestFailures: ReserveDeinvestFailures;
   // Last successfully fetched token flags. A feed outage must not stall every rebalance, so a pass
@@ -184,6 +205,7 @@ export class DangerCoordinator {
     this.maxStalePriceDurationSeconds =
       deps.maxStalePriceDurationSeconds ?? SETTINGS.MAX_STALE_PRICE_DURATION_SECONDS.default;
     this.deinvestFailures = deps.deinvestFailures ?? new ReserveDeinvestFailures();
+    this.priceRetryDelaysMs = deps.priceRetryDelaysMs ?? DANGER_PRICE_RETRY_DELAYS_MS;
     this.intervalTimers = deps.intervalTimers;
   }
 
@@ -247,17 +269,25 @@ export class DangerCoordinator {
           heartbeat?.();
           const kaminoVault = kaminoVaultsMap.get(address(getVaultAddress(vaultEntry)));
           if (!kaminoVault) continue;
-          await this.assessVault(pass, allocation, vaultEntry, kaminoVault);
+          if (pass.assessment !== undefined) {
+            await this.assessVault(pass, pass.assessment, allocation, vaultEntry, kaminoVault);
+          } else {
+            await this.retryKnownDanger(pass, allocation, vaultEntry, kaminoVault);
+          }
         }
       }
-      this.commitPassObservations(pass);
+      if (pass.assessment !== undefined) this.commitPassObservations(pass, pass.assessment);
     } catch (e) {
       if (!(e instanceof PassSupersededError)) throw e;
       logger.error(
         `[danger-coordinator] danger pass ${generation} outlived its watchdog and pass ${e.newerGeneration} has started; abandoning it at ${e.where}`
       );
     }
-    return { directiveByVault: pass.directiveByVault, noNewFundsReserves: pass.cooldownReserves };
+    return {
+      directiveByVault: pass.directiveByVault,
+      noNewFundsReserves: pass.cooldownReserves,
+      assessedVaults: pass.assessedVaults,
+    };
   }
 
   /** Reads the pass's exclusion sets, prices and Scope data, and scores every reserve once for all vaults. */
@@ -288,7 +318,51 @@ export class DangerCoordinator {
     // by identity; those grow in place as the vaults are assessed and responded to,
     // so by the time this pass returns every clear directive observes the same final exclusion sets.
     const clearDirective: VaultRebalanceDirective = { skip: false, blacklistedReserves, cooldownReserves };
+    // Read before the assessment inputs: pending evacuations and blacklist enforcement need only this.
+    const currentLedgerInstant = await getCurrentLedgerInstant(this.kaminoManager.getRpc());
 
+    let assessment: PassAssessment | undefined;
+    try {
+      assessment = await this.assessReserves(
+        generation,
+        vaultsReserves,
+        cooldownReserves,
+        currentLedgerInstant,
+        heartbeat
+      );
+    } catch (error) {
+      if (error instanceof PassSupersededError) throw error;
+      logger.error(
+        `[danger-coordinator] danger pass ${generation} could not assess the reserves; it only retries pending evacuations and enforces the blacklist, and assesses and rebalances no vault: ${error}`
+      );
+    }
+    return {
+      generation,
+      responseDeps,
+      vaultsReserves,
+      currentLedgerInstant,
+      heartbeat,
+      dryRun,
+      blacklistedReserves,
+      cooldownReserves,
+      clearDirective,
+      directiveByVault: new Map<string, VaultRebalanceDirective>(),
+      assessedVaults: new Set<string>(),
+      assessment,
+    };
+  }
+
+  /**
+   * Reads the assessment inputs and scores every reserve once. Adds the reserves with a stale, zero or unreadable price
+   * to `cooldownReserves`. Throws when a required input is unavailable after its retries.
+   */
+  private async assessReserves(
+    generation: number,
+    vaultsReserves: Map<Address, KaminoReserve>,
+    cooldownReserves: Set<string>,
+    currentLedgerInstant: LedgerInstant,
+    heartbeat: (() => void) | undefined
+  ): Promise<PassAssessment> {
     // Build the trigger context once: shared on-chain state for all reserve checks this iteration.
     // Priced mints are the vault and collateral mints plus whatever extra references the triggers need
     // (e.g. the asset a pegged token is quoted against).
@@ -311,10 +385,10 @@ export class DangerCoordinator {
       ...Array.from(collateralReserves.values(), (reserve) => reserve.state.liquidity.mintPubkey),
       ...this.dangerDetector.getPriceReferenceMints(reserveMints, tokenFlags),
     ]);
-    const currentLedgerInstant = await getCurrentLedgerInstant(this.kaminoManager.getRpc());
     const marketPrices = await this.fetchPrices(Array.from(pricedMints), {
       requireAll: true,
       maxAgeSeconds: this.marketPriceMaxAgeSeconds,
+      retryDelaysMs: this.priceRetryDelaysMs,
     });
     const oracleSnapshot = await this.fetchOracleSnapshot(
       rpc,
@@ -343,14 +417,6 @@ export class DangerCoordinator {
       observationStaging: { generation },
       maxStalePriceDurationSeconds: this.maxStalePriceDurationSeconds,
     };
-    const pass: ResponsePass = {
-      generation,
-      responseDeps,
-      vaultsReserves,
-      currentLedgerInstant: dangerContext.currentLedgerInstant,
-      heartbeat,
-    };
-
     const collateralAssessments =
       collateralReserves.size > 0
         ? await this.dangerDetector.assessMarketCollateral(
@@ -386,24 +452,13 @@ export class DangerCoordinator {
     // staged observation: a catastrophic change there has not been acted on, so its baseline must not move.
     const assessedReserves = new Set<string>();
 
-    return {
-      ...pass,
-      dryRun,
-      dangerContext,
-      reserveAssessments,
-      blacklistedReserves,
-      cooldownReserves,
-      clearDirective,
-      directiveByVault: new Map<string, VaultRebalanceDirective>(),
-      observationsToCommit,
-      assessedReserves,
-      marketCollateral,
-    };
+    return { dangerContext, reserveAssessments, observationsToCommit, assessedReserves, marketCollateral };
   }
 
   /** Scores one vault's reserves against its risk appetite and responds when one is dangerous or an evacuation is pending. */
   private async assessVault(
     pass: DangerPass,
+    assessment: PassAssessment,
     allocation: AllocationConfig,
     vaultEntry: AllocationConfig['vaults'][number],
     kaminoVault: KaminoVault
@@ -411,16 +466,14 @@ export class DangerCoordinator {
     const {
       generation,
       dryRun,
-      dangerContext,
-      reserveAssessments,
       blacklistedReserves,
       cooldownReserves,
       clearDirective,
       directiveByVault,
-      observationsToCommit,
-      assessedReserves,
+      assessedVaults,
       vaultsReserves,
     } = pass;
+    const { dangerContext, reserveAssessments, observationsToCommit, assessedReserves } = assessment;
     const riskAppetite = getRiskAppetiteMode(allocation);
     const vaultAddress = getVaultAddress(vaultEntry);
     this.assertPassCurrent(generation, `vault ${vaultAddress}`);
@@ -433,6 +486,7 @@ export class DangerCoordinator {
       directiveByVault.set(vaultAddress, { skip: true });
       return;
     }
+    assessedVaults.add(vaultAddress);
 
     // A vault marked dry-run (globally, or at its allocation/vault level) must never receive real
     // emergency transactions — detect and log only.
@@ -581,6 +635,64 @@ export class DangerCoordinator {
   }
 
   /**
+   * Handles a vault in a pass that could not assess the reserves: retries its pending evacuations, or else enforces the
+   * blacklist. Neither needs the assessment inputs. The vault is skipped for the rebalance and does not count as assessed.
+   */
+  private async retryKnownDanger(
+    pass: DangerPass,
+    allocation: AllocationConfig,
+    vaultEntry: AllocationConfig['vaults'][number],
+    kaminoVault: KaminoVault
+  ): Promise<void> {
+    const { generation, dryRun, blacklistedReserves, directiveByVault, vaultsReserves, currentLedgerInstant } = pass;
+    const vaultAddress = getVaultAddress(vaultEntry);
+    this.assertPassCurrent(generation, `vault ${vaultAddress}`);
+    directiveByVault.set(vaultAddress, { skip: true });
+    if (this.activeResponses.has(vaultAddress)) {
+      logger.error(
+        `[danger-coordinator] an emergency response for vault ${vaultAddress} is still in flight from an earlier pass; skipping the vault this pass`
+      );
+      return;
+    }
+    const effectiveDryRun = dryRun || getAllocationDryRun(allocation, vaultEntry);
+    const pendingEvacuations = this.dangerDetector.getPendingEvacuationReserves(vaultAddress);
+    if (pendingEvacuations.size > 0) {
+      if (effectiveDryRun) {
+        logger.warn(
+          `[danger-coordinator] Dry run: would retry ${pendingEvacuations.size} pending evacuation(s) for vault ${vaultAddress}`
+        );
+        return;
+      }
+      await this.respondAndClearEvacuations(
+        vaultAddress,
+        kaminoVault,
+        new Set([...blacklistedReserves, ...pendingEvacuations]),
+        pendingEvacuations,
+        pass,
+        'evacuation'
+      );
+      return;
+    }
+    if (blacklistedReserves.size > 0) {
+      const vaultState = await kaminoVault.getState();
+      const vaultHoldings = await this.kaminoManager.getVaultHoldings(
+        vaultState,
+        currentLedgerInstant,
+        vaultsReserves,
+        currentLedgerInstant
+      );
+      await this.enforceBlacklist(
+        pass,
+        vaultAddress,
+        kaminoVault,
+        vaultState,
+        vaultHoldings.investedInReserves,
+        effectiveDryRun
+      );
+    }
+  }
+
+  /**
    * No new danger, but enforce zero allocation for previously blacklisted reserves — only when there is actually
    * something to enforce (this vault still holds a blacklisted reserve with a nonzero weight or nonzero invested
    * amount). Skipping the no-op case avoids the per-iteration settle-sleep + invest-crank fee burn on already-exited
@@ -621,13 +733,10 @@ export class DangerCoordinator {
   }
 
   /** Commits the staged trigger observations of the reserves this pass assessed, unless a newer pass has started. */
-  private commitPassObservations({
-    generation,
-    observationsToCommit,
-    assessedReserves,
-    vaultsReserves,
-    marketCollateral,
-  }: DangerPass): void {
+  private commitPassObservations(
+    { generation, vaultsReserves }: DangerPass,
+    { observationsToCommit, assessedReserves, marketCollateral }: PassAssessment
+  ): void {
     for (const reserve of observationsToCommit) {
       if (!assessedReserves.has(reserve)) observationsToCommit.delete(reserve);
     }

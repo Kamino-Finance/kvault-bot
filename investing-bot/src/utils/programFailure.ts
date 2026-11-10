@@ -116,6 +116,29 @@ export function failureCanFollowMissingWithdrawalProceeds(error: unknown, kvault
   );
 }
 
+/**
+ * Whether the payer could not pay an invest's rounding loss. kvault takes the rounding loss from the payer's token
+ * account with the only token transfer that it calls directly (CPI depth 2). A transfer out of the vault runs inside a
+ * klend call (depth 3). So a token "insufficient funds" failure directly under kvault is a payer shortfall, which says
+ * nothing about the reserve.
+ */
+export function isPayerRoundingShortfall(error: unknown, kvaultsProgramId: Address): boolean {
+  const failure = programFailureOf(error);
+  if (!failure?.logs) return false;
+  const { logs, cause } = failure;
+  const terminalFailure = getTerminalCustomFailure(logs, kvaultsProgramId);
+  // The failing programs from kvault inward: exactly kvault and the token program means no klend call between them.
+  if (terminalFailure?.programs.length !== 2) return false;
+  if (hasInstructionError(cause) && getCustomErrorCode(cause.InstructionError[1]) !== terminalFailure.code) {
+    return false;
+  }
+  const failedProgram = terminalFailure.programs[1];
+  return (
+    (failedProgram === TOKEN_PROGRAM_ADDRESS && terminalFailure.code === TOKEN_ERROR__INSUFFICIENT_FUNDS) ||
+    (failedProgram === TOKEN_2022_PROGRAM_ADDRESS && terminalFailure.code === TOKEN_2022_ERROR__INSUFFICIENT_FUNDS)
+  );
+}
+
 function lastAnchorErrorIsInvestAmountBelowMinimum(logs: string[]): boolean {
   const lastAnchorError = [...logs].reverse().find((line) => ANCHOR_ERROR_PATTERN.test(line));
   return (
@@ -178,19 +201,27 @@ export function describeProgramFailure(error: unknown): string {
   return error instanceof Error ? error.message : String(error);
 }
 
+/** The instruction index named by a structured program failure, when it is a non-negative integer. */
+function getFailedInstructionIndex(error: unknown): number | undefined {
+  const cause = programFailureOf(error)?.cause;
+  return hasInstructionError(cause) ? toNonNegativeInteger(cause.InstructionError[0]) : undefined;
+}
+
 /** The submitted instruction identified by a structured program failure, when its index is valid. */
 export function getFailedInstruction(error: unknown, sentIxs: IInstruction[]): IInstruction | undefined {
-  const cause = programFailureOf(error)?.cause;
-  if (!hasInstructionError(cause)) return undefined;
-  const failedIndex = toNonNegativeInteger(cause.InstructionError[0]);
+  const failedIndex = getFailedInstructionIndex(error);
   return failedIndex === undefined ? undefined : sentIxs[failedIndex];
 }
 
 /**
- * Whether a structured error identifies a sent instruction outside `targetIxs`, such as a preamble.
- * An out-of-range index is inconclusive because the sender can append instructions such as a tip.
+ * Whether a structured error identifies an instruction outside `targetIxs`: a sent instruction such as a preamble, or
+ * an index past `sentIxs`. The sender keeps `sentIxs` at their indices and appends its own instructions after them
+ * (compute budget, Jito tip), so an index past `sentIxs` is never a target instruction. A payer that cannot pay the tip
+ * fails there.
  */
 export function failedOutsideInstructions(error: unknown, sentIxs: IInstruction[], targetIxs: IInstruction[]): boolean {
-  const failedIx = getFailedInstruction(error, sentIxs);
-  return failedIx !== undefined && !targetIxs.includes(failedIx);
+  const failedIndex = getFailedInstructionIndex(error);
+  if (failedIndex === undefined) return false;
+  const failedIx = sentIxs[failedIndex];
+  return failedIx === undefined || !targetIxs.includes(failedIx);
 }

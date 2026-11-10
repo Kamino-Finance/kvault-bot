@@ -39,7 +39,7 @@ export function getDefaultTriggers(): DangerTrigger[] {
     new ExchangeRateTrigger(),
     new SupplyApySpikeTrigger(),
     new OracleDivergenceTrigger(),
-    new StalePriceTrigger(),
+    new StalePriceTrigger('vaultReserve'),
     new SecondaryDepegTrigger(),
     new MarketUtilizationTrigger(),
   ];
@@ -47,7 +47,7 @@ export function getDefaultTriggers(): DangerTrigger[] {
 
 /** Collateral checks affect vault reserves in the same lending market. */
 export function getDefaultCollateralTriggers(): CollateralTrigger[] {
-  return [new InfiniteMintTrigger(), new StalePriceTrigger()];
+  return [new InfiniteMintTrigger(), new StalePriceTrigger('marketCollateral')];
 }
 
 /** The trigger name of a vault reserve's folded market collateral result. */

@@ -51,13 +51,15 @@ A component at its reserve's `maxAgePriceSeconds` or `maxAgeTwapSeconds` limit b
 An exact zero, or a price **below one millionth of the KSwap market price**, also blocks new funds immediately. Both
 prices are in USD. For example, Scope at `0.0000001` USD against a `1` USD market price is near zero.
 
-For a zero or near-zero price, the effective age is the greater of its publish age and its observed zero duration.
-A normal value ends the zero clock; failed passes preserve it. Removing Scope pricing or restarting the process also
-clears the clock. A reserve without a valid Scope price chain receives no Scope age check.
+Zero and near-zero prices use their publish age. A continuously refreshed zero blocks deposits without triggering
+evacuation merely because it persists. Oracle divergence stays paused and secondary depeg drops its oracle leg. Checks
+that do not read the Scope price stay active. Market collateral also ages a zero by its duration; see
+[Market collateral](#market-collateral).
+A reserve without a valid Scope price chain receives no Scope age check.
 
 Let `L = MAX_STALE_PRICE_DURATION_SECONDS` (3,600 s by default). This check alone has the following effect:
 
-| Effective age | Score | Risk modes that exit |
+| Publish age | Score | Risk modes that exit |
 | --- | ---: | --- |
 | Through L | 1 | None |
 | Past L, through 2L | 0.4 | PARANOID |
@@ -101,6 +103,10 @@ Allocated reserves and this collateral share three checks and their limits. For 
 | Stale Scope price | New funds stop at the reserve's age limit; its score then falls at the shared L/2L/4L thresholds. |
 | Zero or near-zero Scope price | New funds stop immediately; the same thresholds apply to its effective age. |
 
+For collateral, the effective age of a zero or near-zero price is the greater of its publish age and its observed zero
+duration. A normal value ends the zero clock; failed passes preserve it. Removing Scope pricing or restarting the
+process also clears the clock.
+
 Each collateral's scores contribute to every allocated reserve of the same market, except its own entry. An allocated
 reserve already receives its own checks. Other reserve and vault checks remain specific to the allocated reserve.
 The combined score uses each vault entry's `riskAppetiteMode`.
@@ -115,23 +121,26 @@ separate. See the generated [environment settings](../../../README.md#environmen
 
 ## Failed reads and recovery
 
-Allocated and collateral mints require fresh, finite, positive KSwap prices. Missing, stale, invalid or unavailable
-prices stop the current pass before assessment. A missing reference never turns a near-zero Scope price into a healthy
-reading or ends its zero clock.
+Allocated and collateral mints require fresh, finite, positive KSwap prices. The pass requests the mints without one
+again after 1 s and after 2 s. If a price is still missing, stale, invalid or unavailable, the pass assesses no vault. A
+missing reference never turns a near-zero Scope price into a healthy reading or ends a collateral zero clock.
 
 | Failure | Allocation-loop behavior |
 | --- | --- |
 | Market reserve list, collateral observation or collateral check is unreadable | Reached allocated reserves get no new funds for this pass; this failure alone causes no evacuation. |
-| A required KSwap price is invalid or unavailable | Abort the pass before assessment. |
-| A required batch RPC read or allocated-reserve trigger fails, token flags have no usable snapshot, or the pass times out | Abort the pass. |
+| A required KSwap price is invalid or unavailable after two retries, a required batch RPC read or allocated-reserve trigger fails, or token flags have no usable snapshot | Assess no vault. Still retry each vault's pending evacuations, or else enforce the blacklist. |
+| The ledger time cannot be read, or the pass times out | Abort the pass. |
 
-A failed pass sends no normal rebalance, reconciles no deposit caps, and publishes no replacement exclusion set.
-Price-fetch failures occur before assessment, so they also preserve the existing zero clocks. An enabled invest loop
-keeps running with its last received exclusions and the persisted blacklist state. A later successful pass can clear
-temporary price exclusions and restore caps; permanent blacklist entries require an operator to clear them.
+A pass that assesses no vault counts as failed. It sends no normal rebalance, reconciles no deposit caps, and publishes
+no replacement exclusion set. It moves no trigger observation, so it also preserves the collateral zero clocks. An
+enabled invest loop keeps running with its last received exclusions and the persisted blacklist state. A later
+successful pass can clear temporary price exclusions and restore caps; permanent blacklist entries require an operator
+to clear them.
 
 The danger-pass deadline is `max(vault count, 1) × RPC_REQUEST_TIMEOUT_MS × 4`. From the third consecutive failed pass,
-the loop logs an escalation on every failure and the bot reports not ready.
+the loop logs an escalation on every failure and the bot reports not ready. A configured vault that gets no assessment
+for three passes in a row, for example because one of its reserves does not load, is logged on every pass while the
+other vaults go on; readiness does not change for it.
 
 If price reads fail:
 
@@ -157,7 +166,8 @@ operator clears it. One rejected reserve does not stop the others: a failed batc
 
 Emergency sends broadcast even when their simulation fails, until a (vault, reserve) pair has three attributed failed
 broadcasts; after that it is sent only when simulation passes. A confirmed send resets the count. A funding failure that
-an earlier omitted withdrawal can explain is not counted.
+an earlier omitted withdrawal can explain is not counted. A failure of an instruction that the sender appends, such as
+the Jito tip, is not counted against a reserve.
 
 | State | Scope | Kept in | Ends when |
 | --- | --- | --- | --- |
@@ -174,9 +184,13 @@ an earlier omitted withdrawal can explain is not counted.
 A reserve in reinvest cooldown or with a price/collateral exclusion gets **no new funds**. Its weight stays unchanged.
 Both invest paths drop deposits into it and still allow withdrawals.
 
-For live, non-skipped vaults, the allocation loop lowers frozen caps after withdrawals. Recovery restores the saved cap
-when the current cap is at or below the recorded frozen cap. The entry clears after confirmation. Higher caps stay
-unchanged and their entries clear. Entries also clear when reserves leave the vault. Failed updates retry next pass.
+For live, non-skipped vaults, the allocation loop lowers frozen caps after withdrawals. It records each lower cap before
+it sends it, and the lower cap becomes the frozen cap after it lands. Recovery restores the saved cap only when the
+current cap equals the recorded frozen cap or a cap the bot sent that can still land. The bot saves each freeze or lower
+cap before its transaction leaves the process, with that transaction's last valid block height. While such a send is
+left, the bot ends no freeze: it does not restore the cap or keep an operator's cap. The entry clears after
+confirmation. A cap that an operator changed, up or down, stays unchanged and its entry clears. Entries also clear when
+reserves leave the vault. Failed updates retry next pass.
 
 A dry-run vault only detects and logs: it sends nothing and writes no blacklist entry or pending evacuation.
 
